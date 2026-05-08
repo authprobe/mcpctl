@@ -19,7 +19,7 @@ builds:
       - goos: windows
         goarch: arm64
     ldflags:
-      - -s -w -X github.com/authprobe/mcpctl/internal/cli.Version={{ .Version }}
+      - -s -w -X github.com/authprobe/mcpctl/internal/cli.Version={{ .Version }} -X github.com/authprobe/mcpctl/internal/cli.BuildDate={{ .CommitDate }}
 
 archives:
   - id: mcpctl

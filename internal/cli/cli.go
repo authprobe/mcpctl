@@ -34,6 +34,9 @@ var errCredentialNotFound = errors.New("credential not found")
 // Version is the public CLI version injected by release builds.
 var Version = "dev"
 
+// BuildDate is the UTC commit date injected by release builds.
+var BuildDate = "unknown"
+
 // Runner owns command dispatch and output streams for the mcpctl CLI.
 //
 // Args:
@@ -845,7 +848,11 @@ func (r *Runner) runVersion(args []string) int {
 		fmt.Fprintf(r.stderr, "version does not accept arguments: %s\n", strings.Join(args, " "))
 		return exitUsage
 	}
-	fmt.Fprintf(r.stdout, "mcpctl %s\n", Version)
+	if BuildDate == "" || BuildDate == "unknown" {
+		fmt.Fprintf(r.stdout, "mcpctl %s\n", Version)
+		return exitOK
+	}
+	fmt.Fprintf(r.stdout, "mcpctl %s built %s\n", Version, BuildDate)
 	return exitOK
 }
 

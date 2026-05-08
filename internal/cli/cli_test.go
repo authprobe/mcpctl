@@ -218,6 +218,36 @@ func TestUnknownCommandUsesUsageExit(t *testing.T) {
 	}
 }
 
+// TestVersionIncludesBuildDateWhenAvailable verifies release metadata is visible.
+//
+// Args:
+//
+//	t: Test handle used for assertions and global metadata cleanup.
+//
+// Returns:
+//
+//	None. The test fails when version output omits injected release date metadata.
+func TestVersionIncludesBuildDateWhenAvailable(t *testing.T) {
+	previousVersion := Version
+	previousBuildDate := BuildDate
+	Version = "test-version"
+	BuildDate = "2026-05-08T20:53:46Z"
+	t.Cleanup(func() {
+		Version = previousVersion
+		BuildDate = previousBuildDate
+	})
+
+	var stdout bytes.Buffer
+	code := New(&stdout, nil).Run([]string{"version"})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d", code, exitOK)
+	}
+	want := "mcpctl test-version built 2026-05-08T20:53:46Z\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
 // TestDevWithoutConfigSuggestsInit verifies local commands fail with a next action.
 //
 // Args:
