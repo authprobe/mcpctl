@@ -1,0 +1,55 @@
+version: 2
+
+project_name: mcpctl
+
+builds:
+  - id: mcpctl
+    main: ./cmd/mcpctl
+    binary: mcpctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X github.com/authprobe/mcpctl/internal/cli.Version={{ .Version }}
+
+archives:
+  - id: mcpctl
+    ids:
+      - mcpctl
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- if eq .Os "darwin" }}Darwin{{ else if eq .Os "linux" }}Linux{{ else if eq .Os "windows" }}Windows{{ else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .ShortCommit }}"
+
+release:
+  github:
+    owner: authprobe
+    name: mcpctl
+  replace_existing_artifacts: true
+  make_latest: "{{ if eq .Tag \"edge\" }}false{{ else }}true{{ end }}"
+  prerelease: "{{ if eq .Tag \"edge\" }}true{{ else }}auto{{ end }}"
+  mode: replace

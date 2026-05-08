@@ -24,6 +24,26 @@ With Go installed:
 GOPROXY=direct go install github.com/authprobe/mcpctl/cmd/mcpctl@main
 ```
 
+The install scripts download prebuilt GitHub Release artifacts when available. Until the first stable release, the default channel is `edge`, a moving prerelease built from `main`.
+
+Install a specific release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/authprobe/mcpctl/main/install.sh | MCPCTL_VERSION=v0.1.0 sh
+```
+
+Install the current stable release after stable tags exist:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/authprobe/mcpctl/main/install.sh | MCPCTL_VERSION=latest sh
+```
+
+Install to a custom directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/authprobe/mcpctl/main/install.sh | MCPCTL_INSTALL_DIR="$HOME/bin" sh
+```
+
 Verify:
 
 ```sh
@@ -129,12 +149,31 @@ Run tests:
 go test ./...
 ```
 
+Build release artifacts locally:
+
+```sh
+goreleaser release --snapshot --clean --skip=publish
+```
+
 Run locally:
 
 ```sh
 go run ./cmd/mcpctl --help
 go run ./cmd/mcpctl cloud ping
 ```
+
+## Release Artifacts
+
+Every push to `main` builds an `edge` prerelease with downloadable archives for:
+
+- `mcpctl_Darwin_arm64.tar.gz`
+- `mcpctl_Darwin_x86_64.tar.gz`
+- `mcpctl_Linux_arm64.tar.gz`
+- `mcpctl_Linux_x86_64.tar.gz`
+- `mcpctl_Windows_x86_64.zip`
+- `checksums.txt`
+
+Stable releases are created by pushing tags like `v0.1.0`. The same artifacts are uploaded to the versioned GitHub Release.
 
 ## Contributing
 

@@ -31,6 +31,9 @@ const (
 
 var errCredentialNotFound = errors.New("credential not found")
 
+// Version is the public CLI version injected by release builds.
+var Version = "dev"
+
 // Runner owns command dispatch and output streams for the mcpctl CLI.
 //
 // Args:
@@ -824,7 +827,7 @@ func (r *Runner) runRegistry(args []string) int {
 	return r.runLocalPlaceholder("registry export", args[1:])
 }
 
-// runVersion prints the current development version of the CLI.
+// runVersion prints the current release version of the CLI.
 //
 // Args:
 //
@@ -842,7 +845,7 @@ func (r *Runner) runVersion(args []string) int {
 		fmt.Fprintf(r.stderr, "version does not accept arguments: %s\n", strings.Join(args, " "))
 		return exitUsage
 	}
-	fmt.Fprintln(r.stdout, "mcpctl dev")
+	fmt.Fprintf(r.stdout, "mcpctl %s\n", Version)
 	return exitOK
 }
 

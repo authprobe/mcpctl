@@ -1,0 +1,55 @@
+name: edge
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edge-release
+  cancel-in-progress: true
+
+jobs:
+  edge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build artifacts
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish edge release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f edge "$GITHUB_SHA"
+          git push origin edge --force
+          if ! gh release view edge >/dev/null 2>&1; then
+            gh release create edge --prerelease --latest=false --title "mcpctl edge" --notes "Moving edge build from main." --target "$GITHUB_SHA"
+          fi
+          gh release edit edge --prerelease --latest=false --title "mcpctl edge" --notes "Moving edge build from main commit ${GITHUB_SHA}." --target "$GITHUB_SHA"
+          gh release upload edge dist/*.tar.gz dist/*.zip dist/checksums.txt --clobber
