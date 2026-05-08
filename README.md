@@ -72,11 +72,11 @@ When a workflow needs hosted reports, compatibility runs, or shareable cloud res
 mcpctl auth login
 ```
 
-The intended login model follows familiar browser-based CLI auth:
+The login model follows familiar browser-based CLI auth:
 
 1. the CLI prints a verification URL and one-time code;
 2. you approve in a browser;
-3. the CLI stores credentials in the operating system credential store when available.
+3. the CLI stores short-lived access and refresh credentials in the operating system credential store when available.
 
 CI and automation can use `MCPCTL_TOKEN` when hosted workflows support it.
 
@@ -115,7 +115,7 @@ Future releases will expand this config for command-based servers, Docker-based 
 
 ## Current Status
 
-This repository is early. The public CLI currently exposes the command surfaces and the first no-login cloud check. Deeper local server execution, MCP discovery, tool-readiness validation, report generation, and browser login are being implemented incrementally.
+This repository is early. The public CLI currently exposes the command surfaces, the first no-login cloud check, and browser-based auth client behavior. Deeper local server execution, MCP discovery, tool-readiness validation, report generation, and production `mcpctl.io` endpoint support are being implemented incrementally.
 
 ## Why mcpctl
 

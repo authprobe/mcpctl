@@ -2,13 +2,76 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// memoryCredentialStore keeps credentials in memory for CLI auth tests.
+//
+// Args:
+//
+//	None. Tests configure the store directly.
+//
+// Returns:
+//
+//	Methods return the in-memory credential or errCredentialNotFound.
+type memoryCredentialStore struct {
+	credential credentialRecord
+	hasValue   bool
+}
+
+// Save stores a credential record in memory for later assertions.
+//
+// Args:
+//
+//	credential: Credential value produced by the auth flow.
+//
+// Returns:
+//
+//	nil after updating the in-memory record.
+func (s *memoryCredentialStore) Save(credential credentialRecord) error {
+	s.credential = credential
+	s.hasValue = true
+	return nil
+}
+
+// Load returns the in-memory credential record.
+//
+// Args:
+//
+//	None.
+//
+// Returns:
+//
+//	Stored credential or errCredentialNotFound when empty.
+func (s *memoryCredentialStore) Load() (credentialRecord, error) {
+	if !s.hasValue {
+		return credentialRecord{}, errCredentialNotFound
+	}
+	return s.credential, nil
+}
+
+// Delete removes the in-memory credential record.
+//
+// Args:
+//
+//	None.
+//
+// Returns:
+//
+//	nil after clearing the in-memory record.
+func (s *memoryCredentialStore) Delete() error {
+	s.credential = credentialRecord{}
+	s.hasValue = false
+	return nil
+}
 
 // TestHelpListsPublicCommands verifies that top-level help exposes the local CLI surface.
 //
@@ -210,6 +273,211 @@ func TestAuthStatusUsesEnvironmentToken(t *testing.T) {
 	}
 }
 
+// TestAuthLoginCompletesDeviceFlow verifies browser auth polls and stores tokens.
+//
+// Args:
+//
+//	t: Test handle used for local HTTP server setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when login does not complete the device flow.
+func TestAuthLoginCompletesDeviceFlow(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{}
+	openedURL := ""
+	tokenPolls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/cli/device-authorizations":
+			writeJSON(t, w, deviceAuthorizationResponse{
+				DeviceCode:              "device-123",
+				UserCode:                "ABCD-1234",
+				VerificationURI:         "https://mcpctl.io/device",
+				VerificationURIComplete: "https://mcpctl.io/device?user_code=ABCD-1234",
+				ExpiresIn:               60,
+				Interval:                0,
+			})
+		case "/v1/cli/token":
+			tokenPolls++
+			writeJSON(t, w, tokenResponse{
+				Status:       "approved",
+				AccessToken:  "access-token",
+				RefreshToken: "refresh-token",
+				TokenType:    "bearer",
+				ExpiresAt:    "2026-05-08T18:00:00Z",
+				Account:      tokenAccount{Login: "dev"},
+				Scopes:       []string{"inspect:write", "account:read"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+	runner.sleep = func(time.Duration) {}
+	runner.openURL = func(target string) error {
+		openedURL = target
+		return nil
+	}
+
+	code := runner.Run([]string{"auth", "login", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if tokenPolls != 1 {
+		t.Fatalf("token polls = %d, want 1", tokenPolls)
+	}
+	if openedURL == "" {
+		t.Fatal("browser URL was not opened")
+	}
+	if !store.hasValue {
+		t.Fatal("credential was not stored")
+	}
+	if store.credential.AccessToken != "access-token" || store.credential.RefreshToken != "refresh-token" {
+		t.Fatalf("stored credential = %+v, want access and refresh tokens", store.credential)
+	}
+	if strings.Contains(stdout.String(), "access-token") || strings.Contains(stdout.String(), "refresh-token") {
+		t.Fatalf("stdout leaked token material: %q", stdout.String())
+	}
+}
+
+// TestAuthLoginDeniedDoesNotStoreCredential verifies denied browser approval fails safely.
+//
+// Args:
+//
+//	t: Test handle used for local HTTP server setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when denied login stores credentials.
+func TestAuthLoginDeniedDoesNotStoreCredential(t *testing.T) {
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/cli/device-authorizations":
+			writeJSON(t, w, deviceAuthorizationResponse{
+				DeviceCode:      "device-123",
+				UserCode:        "ABCD-1234",
+				VerificationURI: "https://mcpctl.io/device",
+				ExpiresIn:       60,
+				Interval:        0,
+			})
+		case "/v1/cli/token":
+			writeJSON(t, w, tokenResponse{Status: "access_denied"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(nil, &stderr, server.Client())
+	runner.store = store
+	runner.sleep = func(time.Duration) {}
+	runner.openURL = func(string) error { return nil }
+
+	code := runner.Run([]string{"auth", "login", "-endpoint", server.URL, "-web=false"})
+	if code != exitError {
+		t.Fatalf("Run returned %d, want %d", code, exitError)
+	}
+	if store.hasValue {
+		t.Fatalf("credential stored after denial: %+v", store.credential)
+	}
+	if !strings.Contains(stderr.String(), "access denied") {
+		t.Fatalf("stderr = %q, want access denied", stderr.String())
+	}
+}
+
+// TestAuthStatusReadsStoredCredential verifies status reports credential-store identity.
+//
+// Args:
+//
+//	t: Test handle used for assertions.
+//
+// Returns:
+//
+//	None. The test fails when stored credentials are not reflected in status output.
+func TestAuthStatusReadsStoredCredential(t *testing.T) {
+	var stdout bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:         "https://mcpctl.io",
+			AccountLogin: "dev",
+			Scopes:       []string{"account:read"},
+			Source:       "credential-store",
+		},
+	}
+	runner := New(&stdout, nil)
+	runner.store = store
+
+	code := runner.Run([]string{"auth", "status"})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d", code, exitOK)
+	}
+	if !strings.Contains(stdout.String(), "dev") || !strings.Contains(stdout.String(), "account:read") {
+		t.Fatalf("stdout = %q, want stored credential details", stdout.String())
+	}
+}
+
+// TestAuthLogoutRevokesAndDeletesCredential verifies logout revokes refresh tokens.
+//
+// Args:
+//
+//	t: Test handle used for local HTTP server setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when logout omits revocation or local deletion.
+func TestAuthLogoutRevokesAndDeletesCredential(t *testing.T) {
+	var stdout bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:         "https://mcpctl.io",
+			RefreshToken: "refresh-token",
+		},
+	}
+	revoked := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/cli/token/revoke" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("Decode returned error: %v", err)
+		}
+		if body["refresh_token"] != "refresh-token" {
+			t.Fatalf("refresh_token = %q, want refresh-token", body["refresh_token"])
+		}
+		revoked = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, nil, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{"auth", "logout", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d", code, exitOK)
+	}
+	if !revoked {
+		t.Fatal("refresh token was not revoked")
+	}
+	if store.hasValue {
+		t.Fatal("credential was not deleted")
+	}
+	if !strings.Contains(stdout.String(), "Logged out") {
+		t.Fatalf("stdout = %q, want logout confirmation", stdout.String())
+	}
+}
+
 // TestCloudPingUsesNoLoginEndpoint verifies cloud ping reaches an endpoint without auth.
 //
 // Args:
@@ -240,5 +508,24 @@ func TestCloudPingUsesNoLoginEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "reachable") {
 		t.Fatalf("stdout = %q, want reachable message", stdout.String())
+	}
+}
+
+// writeJSON writes a JSON response for auth flow fixtures.
+//
+// Args:
+//
+//	t: Test handle used for fatal encoding assertions.
+//	w: Response writer receiving JSON.
+//	value: JSON-serializable response value.
+//
+// Returns:
+//
+//	None. The test fails when encoding cannot complete.
+func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(value); err != nil && !errors.Is(err, http.ErrHandlerTimeout) {
+		t.Fatalf("Encode returned error: %v", err)
 	}
 }
