@@ -1,12 +1,13 @@
 $ErrorActionPreference = "Stop"
 
-$package = "github.com/authprobe/mcpctl/cmd/mcpctl@latest"
+$package = "github.com/authprobe/mcpctl/cmd/mcpctl@main"
 
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
   Write-Error "mcpctl installer needs Go until release binaries are published. Install Go from https://go.dev/dl/, then run: go install $package"
 }
 
 Write-Host "Installing mcpctl with go install..."
+$env:GOPROXY = "direct"
 go install $package
 
 $goBin = go env GOBIN

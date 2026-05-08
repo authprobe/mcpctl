@@ -21,7 +21,7 @@ iwr https://raw.githubusercontent.com/authprobe/mcpctl/main/install.ps1 -UseB | 
 With Go installed:
 
 ```sh
-go install github.com/authprobe/mcpctl/cmd/mcpctl@latest
+GOPROXY=direct go install github.com/authprobe/mcpctl/cmd/mcpctl@main
 ```
 
 Verify:

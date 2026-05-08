@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-PACKAGE="github.com/authprobe/mcpctl/cmd/mcpctl@latest"
+PACKAGE="github.com/authprobe/mcpctl/cmd/mcpctl@main"
 
 if ! command -v go >/dev/null 2>&1; then
   echo "mcpctl installer needs Go until release binaries are published." >&2
@@ -11,7 +11,7 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 echo "Installing mcpctl with go install..."
-go install "${PACKAGE}"
+GOPROXY=direct go install "${PACKAGE}"
 
 GOBIN="$(go env GOBIN)"
 if [ -z "${GOBIN}" ]; then
