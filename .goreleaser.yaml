@@ -19,7 +19,7 @@ builds:
       - goos: windows
         goarch: arm64
     ldflags:
-      - -s -w -X github.com/authprobe/mcpctl/internal/cli.Version={{ .Version }} -X github.com/authprobe/mcpctl/internal/cli.BuildDate={{ .CommitDate }}
+      - -s -w -X github.com/authprobe/mcpctl/internal/cli.Version={{ .Version }} -X github.com/authprobe/mcpctl/internal/cli.Commit={{ .ShortCommit }} -X github.com/authprobe/mcpctl/internal/cli.BuildDate={{ .CommitDate }}
 
 archives:
   - id: mcpctl
@@ -43,7 +43,7 @@ checksum:
   algorithm: sha256
 
 snapshot:
-  version_template: "{{ .ShortCommit }}"
+  version_template: "v0.0"
 
 release:
   github:

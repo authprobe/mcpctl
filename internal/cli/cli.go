@@ -32,7 +32,10 @@ const (
 var errCredentialNotFound = errors.New("credential not found")
 
 // Version is the public CLI version injected by release builds.
-var Version = "dev"
+var Version = "v0.0"
+
+// Commit is the short git commit injected by release builds.
+var Commit = "unknown"
 
 // BuildDate is the UTC commit date injected by release builds.
 var BuildDate = "unknown"
@@ -848,11 +851,18 @@ func (r *Runner) runVersion(args []string) int {
 		fmt.Fprintf(r.stderr, "version does not accept arguments: %s\n", strings.Join(args, " "))
 		return exitUsage
 	}
-	if BuildDate == "" || BuildDate == "unknown" {
+	metadata := make([]string, 0, 2)
+	if Commit != "" && Commit != "unknown" {
+		metadata = append(metadata, Commit)
+	}
+	if BuildDate != "" && BuildDate != "unknown" {
+		metadata = append(metadata, "built "+BuildDate)
+	}
+	if len(metadata) == 0 {
 		fmt.Fprintf(r.stdout, "mcpctl %s\n", Version)
 		return exitOK
 	}
-	fmt.Fprintf(r.stdout, "mcpctl %s built %s\n", Version, BuildDate)
+	fmt.Fprintf(r.stdout, "mcpctl %s (%s)\n", Version, strings.Join(metadata, ", "))
 	return exitOK
 }
 

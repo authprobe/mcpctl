@@ -229,11 +229,14 @@ func TestUnknownCommandUsesUsageExit(t *testing.T) {
 //	None. The test fails when version output omits injected release date metadata.
 func TestVersionIncludesBuildDateWhenAvailable(t *testing.T) {
 	previousVersion := Version
+	previousCommit := Commit
 	previousBuildDate := BuildDate
-	Version = "test-version"
+	Version = "v0.0"
+	Commit = "abc1234"
 	BuildDate = "2026-05-08T20:53:46Z"
 	t.Cleanup(func() {
 		Version = previousVersion
+		Commit = previousCommit
 		BuildDate = previousBuildDate
 	})
 
@@ -242,7 +245,7 @@ func TestVersionIncludesBuildDateWhenAvailable(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("Run returned %d, want %d", code, exitOK)
 	}
-	want := "mcpctl test-version built 2026-05-08T20:53:46Z\n"
+	want := "mcpctl v0.0 (abc1234, built 2026-05-08T20:53:46Z)\n"
 	if stdout.String() != want {
 		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
 	}
