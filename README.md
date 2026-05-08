@@ -1,20 +1,141 @@
 # mcpctl
 
-`mcpctl` is the future open-source command line interface for working with Model Context Protocol servers from a developer workstation.
+`mcpctl` is a local-first command line tool for Model Context Protocol server development. Use it to initialize an MCP project, run an MCP server, inspect tools and schemas, validate whether tools are clear enough for agents, and connect to `mcpctl.io` only when you choose a cloud-backed workflow.
 
-This public repository is intentionally minimal while the open-source surface is prepared. Internal planning, roadmap, and commercial-service materials do not belong here.
+Keywords for humans and AI search: MCP CLI, Model Context Protocol CLI, MCP server testing, MCP server validation, MCP tool schema linting, MCP developer tools, MCP readiness checks.
 
-## Status
+## Install
 
-The implementation has not been published yet.
+macOS and Linux:
 
-## Intended Scope
+```sh
+curl -fsSL https://raw.githubusercontent.com/authprobe/mcpctl/main/install.sh | sh
+```
 
-- Local MCP server discovery and validation.
-- Developer-friendly diagnostics for common MCP setup failures.
-- Portable reports that can be used in CI and code review.
-- Clear boundaries between local developer workflows and hosted services.
+Windows PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/authprobe/mcpctl/main/install.ps1 -UseB | iex
+```
+
+With Go installed:
+
+```sh
+go install github.com/authprobe/mcpctl/cmd/mcpctl@latest
+```
+
+Verify:
+
+```sh
+mcpctl --help
+```
+
+## Quick Start
+
+Run this in an MCP server repository:
+
+```sh
+mcpctl init
+mcpctl dev
+mcpctl inspect
+mcpctl validate
+```
+
+The first useful loop is intentionally local:
+
+- `mcpctl init` creates `mcpctl.yaml`.
+- `mcpctl dev` answers: "Can I run this MCP server?"
+- `mcpctl inspect` discovers tools, resources, prompts, schemas, and transport metadata.
+- `mcpctl validate` answers: "Are my tools well described enough for agents?"
+
+Local commands do not require a `mcpctl.io` account.
+
+## No-Login Cloud Check
+
+`mcpctl cloud ping` reaches `mcpctl.io` without login. Use it to confirm that a machine can reach the cloud service before starting hosted workflows.
+
+```sh
+mcpctl cloud ping
+```
+
+For tests or private deployments:
+
+```sh
+mcpctl cloud ping -endpoint https://mcpctl.io
+```
+
+## Cloud Auth
+
+When a workflow needs hosted reports, compatibility runs, or shareable cloud results, authenticate with:
+
+```sh
+mcpctl auth login
+```
+
+The intended login model follows familiar browser-based CLI auth:
+
+1. the CLI prints a verification URL and one-time code;
+2. you approve in a browser;
+3. the CLI stores credentials in the operating system credential store when available.
+
+CI and automation can use `MCPCTL_TOKEN` when hosted workflows support it.
+
+```sh
+mcpctl auth status
+mcpctl auth logout
+```
+
+## Commands
+
+| Command | Purpose | Login required |
+| --- | --- | --- |
+| `mcpctl init` | Create a starter `mcpctl.yaml`. | No |
+| `mcpctl dev` | Run or check a local MCP server. | No |
+| `mcpctl inspect` | Discover MCP tools, resources, prompts, schemas, and transport metadata. | No |
+| `mcpctl validate` | Check MCP tool descriptions and schemas for agent readiness. | No |
+| `mcpctl cloud ping` | Check `mcpctl.io` reachability. | No |
+| `mcpctl auth login` | Connect the CLI to hosted workflows. | Browser approval |
+| `mcpctl auth status` | Show local cloud credential status. | No |
+| `mcpctl auth logout` | Remove local cloud credentials. | No |
+
+## Configuration
+
+`mcpctl init` writes a minimal config:
+
+```yaml
+version: 1
+server:
+  command: ""
+  args: []
+transport:
+  type: stdio
+```
+
+Future releases will expand this config for command-based servers, Docker-based servers, remote endpoints, safe sample calls, report outputs, and CI policy.
+
+## Current Status
+
+This repository is early. The public CLI currently exposes the command surfaces and the first no-login cloud check. Deeper local server execution, MCP discovery, tool-readiness validation, report generation, and browser login are being implemented incrementally.
+
+## Why mcpctl
+
+MCP servers are becoming part of agent and developer workflows. A server that starts locally is not automatically ready for agents: tools need clear names, useful descriptions, strong schemas, predictable errors, and repeatable reports. `mcpctl` aims to make those checks simple from a terminal and portable into CI.
+
+## Development
+
+Run tests:
+
+```sh
+go test ./...
+```
+
+Run locally:
+
+```sh
+go run ./cmd/mcpctl --help
+go run ./cmd/mcpctl cloud ping
+```
 
 ## Contributing
 
-Contribution guidelines will be added when the first implementation milestone lands.
+Public contributions should stay focused on CLI implementation, public usage docs, examples, tests, and developer-facing behavior. Do not add private roadmaps, pricing, customer notes, or internal planning material to this repository.
