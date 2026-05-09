@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -51,13 +52,14 @@ var BuildDate = "unknown"
 //
 //	A CLI runner with no ambient global output dependencies.
 type Runner struct {
-	stdout     io.Writer
-	stderr     io.Writer
-	stdin      io.Reader
-	httpClient *http.Client
-	store      credentialStore
-	openURL    func(string) error
-	sleep      func(time.Duration)
+	stdout      io.Writer
+	stderr      io.Writer
+	stdin       io.Reader
+	httpClient  *http.Client
+	store       credentialStore
+	openURL     func(string) error
+	sleep       func(time.Duration)
+	interactive bool
 }
 
 // credentialStore persists cloud credentials without exposing token values in output.
@@ -147,6 +149,22 @@ type tokenAccount struct {
 	Login string `json:"login"`
 }
 
+// httpStatusError reports non-success cloud responses without leaking large HTML bodies.
+//
+// Args:
+//
+//	None. Values are populated from HTTP response metadata.
+//
+// Returns:
+//
+//	Error returns a concise status message suitable for CLI diagnostics.
+type httpStatusError struct {
+	URL        string
+	Status     string
+	StatusCode int
+	Body       string
+}
+
 // fileCredentialStore stores credentials through the OS credential store when possible.
 //
 // Args:
@@ -196,13 +214,14 @@ func NewWithHTTPClient(stdout io.Writer, stderr io.Writer, httpClient *http.Clie
 		httpClient = http.DefaultClient
 	}
 	return &Runner{
-		stdout:     stdout,
-		stderr:     stderr,
-		stdin:      os.Stdin,
-		httpClient: httpClient,
-		store:      fileCredentialStore{},
-		openURL:    openBrowser,
-		sleep:      time.Sleep,
+		stdout:      stdout,
+		stderr:      stderr,
+		stdin:       os.Stdin,
+		httpClient:  httpClient,
+		store:       fileCredentialStore{},
+		openURL:     openBrowser,
+		sleep:       time.Sleep,
+		interactive: isTerminal(os.Stdin),
 	}
 }
 
@@ -335,15 +354,15 @@ func (r *Runner) runAuth(args []string) int {
 	}
 }
 
-// runAuthLogin exposes the browser-login UX before the live cloud endpoint is wired.
+// runAuthLogin starts an interactive or flag-driven cloud authentication flow.
 //
 // Args:
 //
-//	args: Auth login flags; supports help and --with-token.
+//	args: Auth login flags; supports help, --endpoint, --web, and --with-token.
 //
 // Returns:
 //
-//	Process-style exit code; help succeeds and live login reports pending cloud support.
+//	Process-style exit code for browser or token-based login.
 func (r *Runner) runAuthLogin(args []string) int {
 	if len(args) > 0 && isHelp(args[0]) {
 		fmt.Fprintln(r.stdout, "Usage: mcpctl auth login [--web] [--with-token] [--insecure-storage] [-endpoint URL]")
@@ -366,7 +385,15 @@ func (r *Runner) runAuthLogin(args []string) int {
 	if *withToken {
 		return r.runAuthLoginWithToken(*endpoint, *insecureStorage)
 	}
-	return r.runBrowserLogin(*endpoint, *web, *insecureStorage)
+	if !r.interactive {
+		return r.runBrowserLogin(*endpoint, *web, *insecureStorage, false, nil)
+	}
+	reader := bufio.NewReader(r.stdin)
+	selectedEndpoint, ok := r.promptCloudHost(reader, *endpoint, hasFlag(args, "endpoint"))
+	if !ok {
+		return exitError
+	}
+	return r.runBrowserLogin(selectedEndpoint, *web, *insecureStorage, true, reader)
 }
 
 // runAuthStatus reports whether local cloud credentials are available.
@@ -507,6 +534,8 @@ func (r *Runner) runAuthLoginWithToken(endpoint string, allowPlaintext bool) int
 //	endpoint: Cloud endpoint that serves the device authorization API.
 //	openWeb: Whether the CLI should attempt to open the verification URL.
 //	allowPlaintext: Whether plaintext file fallback is allowed when OS storage is unavailable.
+//	waitForEnter: Whether to pause for Enter before opening the browser.
+//	reader: Optional terminal reader reused after prompts; nil reads from r.stdin.
 //
 // Returns:
 //
@@ -515,9 +544,14 @@ func (r *Runner) runAuthLoginWithToken(endpoint string, allowPlaintext bool) int
 // Errors:
 //
 //	Returns a non-zero code when device creation, approval polling, or credential storage fails.
-func (r *Runner) runBrowserLogin(endpoint string, openWeb bool, allowPlaintext bool) int {
+func (r *Runner) runBrowserLogin(endpoint string, openWeb bool, allowPlaintext bool, waitForEnter bool, reader *bufio.Reader) int {
 	device, err := r.createDeviceAuthorization(endpoint)
 	if err != nil {
+		if isNotFoundStatus(err) && strings.TrimRight(endpoint, "/") == defaultCloud {
+			fmt.Fprintf(r.stderr, "mcpctl.io browser login is not ready yet: %v\n", err)
+			fmt.Fprintln(r.stderr, "Local commands still work without login. Try again after the cloud auth endpoint is deployed.")
+			return exitError
+		}
 		fmt.Fprintf(r.stderr, "failed to start browser login: %v\n", err)
 		return exitError
 	}
@@ -526,10 +560,22 @@ func (r *Runner) runBrowserLogin(endpoint string, openWeb bool, allowPlaintext b
 	if verificationURL == "" {
 		verificationURL = device.VerificationURI
 	}
-	fmt.Fprintf(r.stdout, "Open this URL to authenticate: %s\n", verificationURL)
-	fmt.Fprintf(r.stdout, "Enter code: %s\n", device.UserCode)
+	fmt.Fprintf(r.stdout, "\n! First copy your one-time code: %s\n", device.UserCode)
 	if device.ExpiresIn > 0 {
 		fmt.Fprintf(r.stdout, "Code expires in %d seconds.\n", device.ExpiresIn)
+	}
+	if openWeb && waitForEnter && verificationURL != "" {
+		fmt.Fprintf(r.stdout, "Press Enter to open %s in your browser...", verificationURL)
+		if reader == nil {
+			reader = bufio.NewReader(r.stdin)
+		}
+		if _, err := reader.ReadString('\n'); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintf(r.stderr, "failed to read confirmation: %v\n", err)
+			return exitError
+		}
+		fmt.Fprintln(r.stdout)
+	} else {
+		fmt.Fprintf(r.stdout, "Open this URL to authenticate: %s\n", verificationURL)
 	}
 	if openWeb && verificationURL != "" {
 		if err := r.openURL(verificationURL); err != nil {
@@ -704,7 +750,12 @@ func (r *Runner) postJSON(endpoint string, path string, payload any, out any) er
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s returned %s: %s", requestURL, resp.Status, strings.TrimSpace(string(limited)))
+		return httpStatusError{
+			URL:        requestURL,
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Body:       summarizeHTTPBody(string(limited)),
+		}
 	}
 	if out == nil {
 		return nil
@@ -713,6 +764,74 @@ func (r *Runner) postJSON(endpoint string, path string, payload any, out any) er
 		return err
 	}
 	return nil
+}
+
+// Error formats an HTTP status failure as a concise CLI diagnostic.
+//
+// Args:
+//
+//	None. The receiver contains the URL, status, and optional response body summary.
+//
+// Returns:
+//
+//	A single-line message describing the failed HTTP response.
+func (e httpStatusError) Error() string {
+	if strings.TrimSpace(e.Body) == "" {
+		return fmt.Sprintf("%s returned %s", e.URL, e.Status)
+	}
+	return fmt.Sprintf("%s returned %s: %s", e.URL, e.Status, e.Body)
+}
+
+// promptCloudHost asks interactive users which mcpctl cloud host they use.
+//
+// Args:
+//
+//	reader: Terminal input shared with later browser-confirmation prompts.
+//	endpoint: Default or flag-provided endpoint value.
+//	endpointProvided: Whether the endpoint was supplied on the command line.
+//
+// Returns:
+//
+//	Selected endpoint and true, or false when input cannot be read or validated.
+func (r *Runner) promptCloudHost(reader *bufio.Reader, endpoint string, endpointProvided bool) (string, bool) {
+	if endpointProvided {
+		fmt.Fprintf(r.stdout, "? Where do you use mcpctl? %s\n", endpoint)
+		return endpoint, true
+	}
+
+	fmt.Fprintln(r.stdout, "? Where do you use mcpctl?")
+	fmt.Fprintln(r.stdout, "  1. mcpctl.io")
+	fmt.Fprintln(r.stdout, "  2. Other")
+	fmt.Fprint(r.stdout, "Select host [1]: ")
+	choice, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(r.stderr, "failed to read host selection: %v\n", err)
+		return "", false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(choice)) {
+	case "", "1", "mcpctl.io", defaultCloud:
+		return defaultCloud, true
+	case "2", "other":
+		fmt.Fprint(r.stdout, "Enter mcpctl endpoint: ")
+		customEndpoint, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintf(r.stderr, "failed to read endpoint: %v\n", err)
+			return "", false
+		}
+		customEndpoint = strings.TrimSpace(customEndpoint)
+		if customEndpoint == "" {
+			fmt.Fprintln(r.stderr, "endpoint cannot be empty")
+			return "", false
+		}
+		return customEndpoint, true
+	default:
+		if strings.Contains(choice, "://") {
+			return strings.TrimSpace(choice), true
+		}
+		fmt.Fprintf(r.stderr, "unsupported host selection %q\n", strings.TrimSpace(choice))
+		return "", false
+	}
 }
 
 // credentialStore returns the active credential store for this command.
@@ -958,6 +1077,91 @@ func (r *Runner) writeCloudHelp(out io.Writer) {
 //	True when the argument is -h, --help, or help.
 func isHelp(arg string) bool {
 	return arg == "-h" || arg == "--help" || arg == "help"
+}
+
+// hasFlag reports whether command arguments contain a specific flag name.
+//
+// Args:
+//
+//	args: Raw command arguments before flag parsing.
+//	name: Flag name without leading dashes.
+//
+// Returns:
+//
+//	True when args contains -name, --name, or an equals-form assignment.
+func hasFlag(args []string, name string) bool {
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		trimmed := strings.TrimLeft(arg, "-")
+		if trimmed == name || strings.HasPrefix(trimmed, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// isTerminal reports whether a file is attached to a character device.
+//
+// Args:
+//
+//	file: File handle to inspect; nil is treated as non-interactive.
+//
+// Returns:
+//
+//	True when the file mode indicates a terminal-like character device.
+func isTerminal(file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// isNotFoundStatus reports whether an error wraps an HTTP 404 response.
+//
+// Args:
+//
+//	err: Error returned by cloud HTTP helpers.
+//
+// Returns:
+//
+//	True when err contains httpStatusError with StatusCode 404.
+func isNotFoundStatus(err error) bool {
+	var statusErr httpStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusNotFound
+}
+
+// summarizeHTTPBody compacts failed HTTP bodies for readable CLI errors.
+//
+// Args:
+//
+//	body: Raw response body text, possibly HTML from a frontend 404 page.
+//
+// Returns:
+//
+//	A short one-line summary with large HTML pages replaced by a placeholder.
+func summarizeHTTPBody(body string) string {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "<!doctype html") || strings.Contains(lower, "<html") {
+		return "HTML response omitted"
+	}
+	summary := strings.Join(strings.Fields(trimmed), " ")
+	if len(summary) > 300 {
+		return summary[:300] + "..."
+	}
+	return summary
 }
 
 // writeInitialConfig creates the default config file used by early local commands.

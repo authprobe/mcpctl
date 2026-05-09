@@ -378,6 +378,107 @@ func TestAuthLoginCompletesDeviceFlow(t *testing.T) {
 	}
 }
 
+// TestAuthLoginInteractiveBrowserOnly verifies terminal login uses host and browser prompts.
+//
+// Args:
+//
+//	t: Test handle used for local HTTP server setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when interactive login exposes a non-browser choice.
+func TestAuthLoginInteractiveBrowserOnly(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{}
+	openedURL := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/cli/device-authorizations":
+			writeJSON(t, w, deviceAuthorizationResponse{
+				DeviceCode:              "device-123",
+				UserCode:                "ABCD-1234",
+				VerificationURI:         "https://mcpctl.io/device",
+				VerificationURIComplete: "https://mcpctl.io/device?user_code=ABCD-1234",
+				ExpiresIn:               60,
+				Interval:                0,
+			})
+		case "/v1/cli/token":
+			writeJSON(t, w, tokenResponse{
+				Status:       "approved",
+				AccessToken:  "access-token",
+				RefreshToken: "refresh-token",
+				TokenType:    "bearer",
+				Account:      tokenAccount{Login: "dev"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+	runner.sleep = func(time.Duration) {}
+	runner.openURL = func(target string) error {
+		openedURL = target
+		return nil
+	}
+	runner.stdin = strings.NewReader("\n")
+	runner.interactive = true
+
+	code := runner.Run([]string{"auth", "login", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if openedURL != "https://mcpctl.io/device?user_code=ABCD-1234" {
+		t.Fatalf("opened URL = %q, want verification URL", openedURL)
+	}
+	output := stdout.String()
+	for _, want := range []string{"Where do you use mcpctl?", "First copy your one-time code", "Press Enter to open"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("stdout = %q, want %q", output, want)
+		}
+	}
+	for _, unwanted := range []string{"SSH", "Paste an authentication token"} {
+		if strings.Contains(output, unwanted) {
+			t.Fatalf("stdout = %q, did not want %q", output, unwanted)
+		}
+	}
+}
+
+// TestAuthLoginOmitsHTMLFailureBody verifies frontend 404 pages stay concise.
+//
+// Args:
+//
+//	t: Test handle used for local HTTP server setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when a large HTML error body leaks to stderr.
+func TestAuthLoginOmitsHTMLFailureBody(t *testing.T) {
+	var stderr bytes.Buffer
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		if _, err := w.Write([]byte("<!DOCTYPE html><html><head><title>404</title></head><body>large frontend page</body></html>")); err != nil {
+			t.Fatalf("Write returned error: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(nil, &stderr, server.Client())
+	code := runner.Run([]string{"auth", "login", "-endpoint", server.URL})
+	if code != exitError {
+		t.Fatalf("Run returned %d, want %d", code, exitError)
+	}
+	if !strings.Contains(stderr.String(), "HTML response omitted") {
+		t.Fatalf("stderr = %q, want HTML placeholder", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "<!DOCTYPE html>") || strings.Contains(stderr.String(), "large frontend page") {
+		t.Fatalf("stderr leaked HTML body: %q", stderr.String())
+	}
+}
+
 // TestAuthLoginDeniedDoesNotStoreCredential verifies denied browser approval fails safely.
 //
 // Args:

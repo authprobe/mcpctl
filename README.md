@@ -98,6 +98,8 @@ The login model follows familiar browser-based CLI auth:
 2. you approve in a browser;
 3. the CLI stores short-lived access and refresh credentials in the operating system credential store when available.
 
+`mcpctl` only supports browser approval for interactive login. There is no SSH protocol setup path.
+
 CI and automation can use `MCPCTL_TOKEN` when hosted workflows support it.
 
 ```sh
