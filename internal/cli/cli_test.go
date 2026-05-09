@@ -405,11 +405,10 @@ func TestAuthLoginInteractiveBrowserOnly(t *testing.T) {
 			})
 		case "/v1/cli/token":
 			writeJSON(t, w, tokenResponse{
-				Status:       "approved",
-				AccessToken:  "access-token",
-				RefreshToken: "refresh-token",
-				TokenType:    "bearer",
-				Account:      tokenAccount{Login: "dev"},
+				Status:      "approved",
+				AccessToken: "access-token",
+				TokenType:   "bearer",
+				Account:     tokenAccount{Login: "dev"},
 			})
 		default:
 			http.NotFound(w, r)

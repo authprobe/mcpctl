@@ -25,7 +25,7 @@ const (
 	exitOK          = 0
 	exitUsage       = 2
 	exitError       = 1
-	defaultCloud    = "https://mcpctl.io"
+	defaultCloud    = "https://console.mcpctl.io"
 	keychainService = "mcpctl"
 	keychainAccount = "mcpctl.io"
 )
@@ -671,9 +671,6 @@ func (r *Runner) pollDeviceToken(endpoint string, device deviceAuthorizationResp
 		case "approved":
 			if token.AccessToken == "" {
 				return tokenResponse{}, fmt.Errorf("approved token response missing access token")
-			}
-			if token.RefreshToken == "" {
-				return tokenResponse{}, fmt.Errorf("approved token response missing refresh token")
 			}
 			return token, nil
 		case "authorization_pending", "":

@@ -81,7 +81,7 @@ mcpctl cloud ping
 For tests or private deployments:
 
 ```sh
-mcpctl cloud ping -endpoint https://mcpctl.io
+mcpctl cloud ping -endpoint https://console.mcpctl.io
 ```
 
 ## Cloud Auth
@@ -99,6 +99,7 @@ The login model follows familiar browser-based CLI auth:
 3. the CLI stores short-lived access and refresh credentials in the operating system credential store when available.
 
 `mcpctl` only supports browser approval for interactive login. There is no SSH protocol setup path.
+The hosted CLI auth endpoint is currently served from `https://console.mcpctl.io`.
 
 CI and automation can use `MCPCTL_TOKEN` when hosted workflows support it.
 
