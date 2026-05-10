@@ -775,6 +775,89 @@ func TestDebugOAuthCreatesHostedInspectRun(t *testing.T) {
 	}
 }
 
+// TestDebugConnectCreatesHostedCompatibilityRun verifies the CLI calls the managed compatibility API.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when the CLI omits auth, sends the wrong payload, or hides run URLs.
+func TestDebugConnectCreatesHostedCompatibilityRun(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        "https://console.staging.mcpctl.io",
+			AccessToken: "operator-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	var gotAuth string
+	var gotPayload debugConnectRunRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/operator/compat/runs":
+			gotAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				t.Fatalf("Decode request body returned error: %v", err)
+			}
+			writeJSON(t, w, debugConnectRunResponse{
+				RunID:      "crun_test",
+				Status:     "failed",
+				TraceURL:   "https://console.staging.mcpctl.io/compat/trace/crun_test/mcp/",
+				ReportURL:  "https://console.staging.mcpctl.io/compat/r/crun_test",
+				GatewayURL: "https://console.staging.mcpctl.io/compat/gateway/crun_test/mcp/",
+			})
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{
+		"debug",
+		"connect",
+		server.URL + "/mcp",
+		"--client",
+		"chatgpt",
+		"--mode",
+		"gateway",
+		"--share",
+		"-endpoint",
+		server.URL,
+	})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if gotAuth != "Bearer operator-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotPayload.TargetURL != server.URL+"/mcp" || gotPayload.ClientProfile != "chatgpt" || gotPayload.Mode != "gateway" {
+		t.Fatalf("unexpected compat payload: %+v", gotPayload)
+	}
+	if gotPayload.UpstreamMode != "proxy" || !gotPayload.Shareable {
+		t.Fatalf("unexpected upstream/share fields: %+v", gotPayload)
+	}
+	for _, probe := range []string{"oauth_discovery", "mcp_initialize", "tools_list"} {
+		if !containsString(gotPayload.SelectedProbes, probe) {
+			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
+		}
+	}
+	for _, want := range []string{"Compatibility run: crun_test (failed)", "Trace URL:", "Report:", "Gateway URL:"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+}
+
 // externalURL builds an absolute URL for the current httptest request host.
 //
 // Args:

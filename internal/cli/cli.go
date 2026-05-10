@@ -185,6 +185,41 @@ type debugOAuthRunResponse struct {
 	ReportURL string `json:"report_url"`
 }
 
+// debugConnectRunRequest is the hosted compatibility lab payload for client connection debugging.
+//
+// Args:
+//
+//	None. Values are encoded into the cloud API request body.
+//
+// Returns:
+//
+//	The JSON shape accepted by `/v1/operator/compat/runs`.
+type debugConnectRunRequest struct {
+	TargetURL      string   `json:"target_url"`
+	ClientProfile  string   `json:"client_profile,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
+	UpstreamMode   string   `json:"upstream_mode,omitempty"`
+	SelectedProbes []string `json:"selected_probes,omitempty"`
+	Shareable      bool     `json:"shareable"`
+}
+
+// debugConnectRunResponse captures compatibility lab run creation results.
+//
+// Args:
+//
+//	None. Values are decoded from mcpctl.io JSON.
+//
+// Returns:
+//
+//	Run metadata including trace, report, and optional gateway URLs.
+type debugConnectRunResponse struct {
+	RunID      string `json:"run_id"`
+	Status     string `json:"status"`
+	TraceURL   string `json:"trace_url"`
+	ReportURL  string `json:"report_url"`
+	GatewayURL string `json:"gateway_url,omitempty"`
+}
+
 // oauthDiscoveryReport records the local OAuth discovery chain for one MCP endpoint.
 //
 // Args:
@@ -341,11 +376,107 @@ func (r *Runner) runDebug(args []string) int {
 	switch args[0] {
 	case "oauth":
 		return r.runDebugOAuth(args[1:])
+	case "connect":
+		return r.runDebugConnect(args[1:])
 	default:
 		fmt.Fprintf(r.stderr, "unknown debug command %q\n\n", args[0])
 		r.writeDebugHelp(r.stderr)
 		return exitUsage
 	}
+}
+
+// runDebugConnect starts a managed compatibility lab run for one MCP endpoint and client profile.
+//
+// Args:
+//
+//	args: Flags plus one MCP endpoint URL; supports -endpoint, --client, --mode, and --share.
+//
+// Returns:
+//
+//	Process-style exit code indicating whether the compatibility run was created.
+func (r *Runner) runDebugConnect(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl debug connect <mcp-url> [--client name] [--mode trace|gateway] [--share] [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Run a managed client compatibility check for a remote MCP endpoint.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("debug connect", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for hosted debugging")
+	clientProfile := flags.String("client", "generic", "client compatibility profile, for example chatgpt")
+	mode := flags.String("mode", "trace", "compatibility run mode: trace or gateway")
+	share := flags.Bool("share", false, "request a shareable report URL")
+	if err := flags.Parse(reorderDebugConnectArgs(args)); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() != 1 {
+		fmt.Fprintln(r.stderr, "Usage: mcpctl debug connect <mcp-url> [--client name] [--mode trace|gateway] [--share] [-endpoint URL]")
+		return exitUsage
+	}
+	targetURL := strings.TrimSpace(flags.Arg(0))
+	if _, err := url.ParseRequestURI(targetURL); err != nil {
+		fmt.Fprintf(r.stderr, "invalid MCP endpoint URL %q\n", targetURL)
+		return exitUsage
+	}
+	response, err := r.createHostedCompatRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile), strings.TrimSpace(*mode), *share)
+	if err != nil {
+		fmt.Fprintf(r.stderr, "debug connect failed: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(r.stdout, "Compatibility run: %s (%s)\n", response.RunID, response.Status)
+	fmt.Fprintf(r.stdout, "Trace URL: %s\n", response.TraceURL)
+	fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
+	if strings.TrimSpace(response.GatewayURL) != "" {
+		fmt.Fprintf(r.stdout, "Gateway URL: %s\n", response.GatewayURL)
+	}
+	return exitOK
+}
+
+// createHostedCompatRun creates a hosted compatibility lab run through mcpctl.io.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint serving compatibility APIs.
+//	targetURL: Remote MCP endpoint to test.
+//	clientProfile: Client compatibility profile id or alias.
+//	mode: Compatibility run mode, usually trace or gateway.
+//	shareable: Whether the report should be shareable.
+//
+// Returns:
+//
+//	Created compatibility run metadata with trace/report URLs.
+//
+// Errors:
+//
+//	Fails when credentials are missing or the compatibility API rejects the run.
+func (r *Runner) createHostedCompatRun(endpoint string, targetURL string, clientProfile string, mode string, shareable bool) (debugConnectRunResponse, error) {
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			return debugConnectRunResponse{}, errors.New("not authenticated; run `mcpctl auth login` before debug connect")
+		}
+		return debugConnectRunResponse{}, fmt.Errorf("load cloud credentials: %w", err)
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" {
+		return debugConnectRunResponse{}, errors.New("stored cloud credential is missing an access token")
+	}
+	request := debugConnectRunRequest{
+		TargetURL:     targetURL,
+		ClientProfile: clientProfile,
+		Mode:          mode,
+		UpstreamMode:  "proxy",
+		SelectedProbes: []string{
+			"oauth_discovery",
+			"mcp_initialize",
+			"tools_list",
+		},
+		Shareable: shareable,
+	}
+	var response debugConnectRunResponse
+	if err := r.postAuthenticatedJSON(endpoint, "/v1/operator/compat/runs", credential.AccessToken, request, &response); err != nil {
+		return debugConnectRunResponse{}, err
+	}
+	return response, nil
 }
 
 // runDebugOAuth starts a hosted OAuth discovery/debug inspect run.
@@ -487,6 +618,54 @@ func debugOAuthFlagNeedsValue(arg string) bool {
 	}
 	switch strings.TrimLeft(arg, "-") {
 	case "client", "endpoint":
+		return true
+	default:
+		return false
+	}
+}
+
+// reorderDebugConnectArgs moves flags before the MCP endpoint for Go's flag parser.
+//
+// Args:
+//
+//	args: Raw `debug connect` arguments, possibly with flags after the MCP URL.
+//
+// Returns:
+//
+//	Arguments with option tokens first and positional values last.
+func reorderDebugConnectArgs(args []string) []string {
+	var flags []string
+	var positional []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+			if debugConnectFlagNeedsValue(arg) && index+1 < len(args) {
+				index++
+				flags = append(flags, args[index])
+			}
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
+}
+
+// debugConnectFlagNeedsValue reports whether a debug connect flag consumes the next token.
+//
+// Args:
+//
+//	arg: Raw flag token, with either one or two leading dashes.
+//
+// Returns:
+//
+//	True when the flag expects a separate value token.
+func debugConnectFlagNeedsValue(arg string) bool {
+	if strings.Contains(arg, "=") {
+		return false
+	}
+	switch strings.TrimLeft(arg, "-") {
+	case "client", "endpoint", "mode":
 		return true
 	default:
 		return false
@@ -1532,7 +1711,7 @@ func (r *Runner) runVersion(args []string) int {
 //
 //	None. The function writes directly to the supplied writer.
 func (r *Runner) writeHelp(out io.Writer) {
-	commands := []string{"init", "dev", "inspect", "validate", "debug oauth", "auth login", "auth status", "cloud ping", "report", "registry export", "doctor", "version"}
+	commands := []string{"init", "dev", "inspect", "validate", "debug connect", "debug oauth", "auth login", "auth status", "cloud ping", "report", "registry export", "doctor", "version"}
 	sort.Strings(commands)
 
 	fmt.Fprintln(out, "Usage: mcpctl <command> [flags]")
@@ -1556,6 +1735,7 @@ func (r *Runner) writeDebugHelp(out io.Writer) {
 	fmt.Fprintln(out, "Usage: mcpctl debug <command> [flags]")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Commands:")
+	fmt.Fprintln(out, "  connect  Run a managed client compatibility check for a remote MCP endpoint")
 	fmt.Fprintln(out, "  oauth  Run hosted OAuth discovery diagnostics for a remote MCP endpoint")
 }
 
