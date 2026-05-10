@@ -153,6 +153,62 @@ type tokenAccount struct {
 	Login string `json:"login"`
 }
 
+// debugOAuthRunRequest is the hosted inspect payload for OAuth discovery debugging.
+//
+// Args:
+//
+//	None. Values are encoded into the cloud API request body.
+//
+// Returns:
+//
+//	The JSON shape accepted by `/v1/operator/inspect/runs`.
+type debugOAuthRunRequest struct {
+	EndpointURL    string   `json:"endpointUrl"`
+	TransportMode  string   `json:"transportMode"`
+	SelectedProbes []string `json:"selectedProbes"`
+	ClientProfiles []string `json:"clientProfiles,omitempty"`
+	SpecVersions   []string `json:"specVersions,omitempty"`
+}
+
+// debugOAuthRunResponse captures hosted inspect run creation results.
+//
+// Args:
+//
+//	None. Values are decoded from mcpctl.io JSON.
+//
+// Returns:
+//
+//	Run metadata including the shareable report URL.
+type debugOAuthRunResponse struct {
+	RunID     string `json:"run_id"`
+	Status    string `json:"status"`
+	ReportURL string `json:"report_url"`
+}
+
+// oauthDiscoveryReport records the local OAuth discovery chain for one MCP endpoint.
+//
+// Args:
+//
+//	None. Values are populated from HTTP probes.
+//
+// Returns:
+//
+//	A printable diagnostic summary of protected-resource and authorization-server metadata.
+type oauthDiscoveryReport struct {
+	TargetURL                 string
+	TargetStatus              string
+	ResourceMetadataURL       string
+	ResourceMetadataStatus    string
+	Resource                  string
+	AuthorizationServer       string
+	AuthorizationMetadataURL  string
+	AuthorizationStatus       string
+	AuthorizationEndpoint     string
+	TokenEndpoint             string
+	RegistrationEndpoint      string
+	CodeChallengeMethodsCount int
+}
+
 // httpStatusError reports non-success cloud responses without leaking large HTML bodies.
 //
 // Args:
@@ -253,6 +309,8 @@ func (r *Runner) Run(args []string) int {
 		return r.runAuth(args[1:])
 	case "cloud":
 		return r.runCloud(args[1:])
+	case "debug":
+		return r.runDebug(args[1:])
 	case "login":
 		return r.runAuth(append([]string{"login"}, args[1:]...))
 	case "registry":
@@ -264,6 +322,380 @@ func (r *Runner) Run(args []string) int {
 		r.writeHelp(r.stderr)
 		return exitUsage
 	}
+}
+
+// runDebug dispatches hosted debugging command surfaces.
+//
+// Args:
+//
+//	args: Debug subcommand arguments after "debug".
+//
+// Returns:
+//
+//	Process-style exit code for debug command handling.
+func (r *Runner) runDebug(args []string) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		r.writeDebugHelp(r.stdout)
+		return exitOK
+	}
+	switch args[0] {
+	case "oauth":
+		return r.runDebugOAuth(args[1:])
+	default:
+		fmt.Fprintf(r.stderr, "unknown debug command %q\n\n", args[0])
+		r.writeDebugHelp(r.stderr)
+		return exitUsage
+	}
+}
+
+// runDebugOAuth starts a hosted OAuth discovery/debug inspect run.
+//
+// Args:
+//
+//	args: Flags plus one MCP endpoint URL; supports -endpoint, --client, and --share.
+//
+// Returns:
+//
+//	Process-style exit code indicating whether the run was created.
+func (r *Runner) runDebugOAuth(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl debug oauth <mcp-url> [--client name] [--share] [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Run hosted OAuth discovery diagnostics for a remote MCP endpoint.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("debug oauth", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for hosted debugging")
+	clientProfile := flags.String("client", "", "client compatibility profile, for example chatgpt")
+	share := flags.Bool("share", false, "print the shareable report URL")
+	if err := flags.Parse(reorderDebugOAuthArgs(args)); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() != 1 {
+		fmt.Fprintln(r.stderr, "Usage: mcpctl debug oauth <mcp-url> [--client name] [--share] [-endpoint URL]")
+		return exitUsage
+	}
+	targetURL := strings.TrimSpace(flags.Arg(0))
+	if _, err := url.ParseRequestURI(targetURL); err != nil {
+		fmt.Fprintf(r.stderr, "invalid MCP endpoint URL %q\n", targetURL)
+		return exitUsage
+	}
+	report, err := r.runLocalOAuthDiscovery(targetURL)
+	if err != nil {
+		fmt.Fprintf(r.stderr, "debug oauth failed: %v\n", err)
+		return exitError
+	}
+	r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
+
+	if *share {
+		response, err := r.createHostedOAuthDebugRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile))
+		if err != nil {
+			fmt.Fprintf(r.stderr, "warning: hosted share failed: %v\n", err)
+			return exitOK
+		}
+		fmt.Fprintf(r.stdout, "Hosted run: %s (%s)\n", response.RunID, response.Status)
+		fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
+	}
+	return exitOK
+}
+
+// createHostedOAuthDebugRun creates a shareable hosted inspect report for OAuth debugging.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint that serves hosted inspect APIs.
+//	targetURL: Remote MCP endpoint to inspect.
+//	clientProfile: Optional client profile name such as `chatgpt`.
+//
+// Returns:
+//
+//	Created hosted run metadata with a report URL when available.
+//
+// Errors:
+//
+//	Fails when credentials are missing or the hosted inspect API rejects the run.
+func (r *Runner) createHostedOAuthDebugRun(endpoint string, targetURL string, clientProfile string) (debugOAuthRunResponse, error) {
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			return debugOAuthRunResponse{}, errors.New("not authenticated; run `mcpctl auth login` before --share")
+		}
+		return debugOAuthRunResponse{}, fmt.Errorf("load cloud credentials: %w", err)
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" {
+		return debugOAuthRunResponse{}, errors.New("stored cloud credential is missing an access token")
+	}
+	request := debugOAuthRunRequest{
+		EndpointURL:   targetURL,
+		TransportMode: "auto",
+		SelectedProbes: []string{
+			"auth_discovery",
+			"spec_compliance",
+			"client_compatibility",
+		},
+		SpecVersions: []string{"2025-11-25", "2025-06-18"},
+	}
+	if clientProfile != "" {
+		request.ClientProfiles = []string{clientProfile}
+	}
+	var response debugOAuthRunResponse
+	if err := r.postAuthenticatedJSON(endpoint, "/v1/operator/inspect/runs", credential.AccessToken, request, &response); err != nil {
+		return debugOAuthRunResponse{}, err
+	}
+	return response, nil
+}
+
+// reorderDebugOAuthArgs moves flags before positional targets for Go's flag parser.
+//
+// Args:
+//
+//	args: Raw `debug oauth` arguments, possibly with flags after the MCP URL.
+//
+// Returns:
+//
+//	Arguments with option tokens first and positional values last.
+func reorderDebugOAuthArgs(args []string) []string {
+	var flags []string
+	var positional []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+			if debugOAuthFlagNeedsValue(arg) && index+1 < len(args) {
+				index++
+				flags = append(flags, args[index])
+			}
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
+}
+
+// debugOAuthFlagNeedsValue reports whether a debug oauth flag consumes the next token.
+//
+// Args:
+//
+//	arg: Raw flag token, with either one or two leading dashes.
+//
+// Returns:
+//
+//	True when the flag expects a separate value token.
+func debugOAuthFlagNeedsValue(arg string) bool {
+	if strings.Contains(arg, "=") {
+		return false
+	}
+	switch strings.TrimLeft(arg, "-") {
+	case "client", "endpoint":
+		return true
+	default:
+		return false
+	}
+}
+
+// runLocalOAuthDiscovery follows the OAuth metadata chain advertised by one MCP endpoint.
+//
+// Args:
+//
+//	targetURL: Remote MCP endpoint URL to probe without credentials.
+//
+// Returns:
+//
+//	A discovery report containing status codes, metadata URLs, and OAuth endpoints.
+//
+// Errors:
+//
+//	Fails when the target cannot be fetched, omits resource metadata, or returns invalid metadata JSON.
+func (r *Runner) runLocalOAuthDiscovery(targetURL string) (oauthDiscoveryReport, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	targetReq, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return oauthDiscoveryReport{}, err
+	}
+	targetReq.Header.Set("Accept", "application/json")
+	targetReq.Header.Set("User-Agent", "mcpctl/dev")
+	targetResp, err := r.httpClient.Do(targetReq)
+	if err != nil {
+		return oauthDiscoveryReport{}, err
+	}
+	defer targetResp.Body.Close()
+
+	report := oauthDiscoveryReport{
+		TargetURL:           targetURL,
+		TargetStatus:        targetResp.Status,
+		ResourceMetadataURL: extractResourceMetadataURL(targetResp.Header.Values("WWW-Authenticate")),
+	}
+	if report.ResourceMetadataURL == "" {
+		return report, errors.New("target did not advertise resource_metadata in WWW-Authenticate")
+	}
+
+	var resourceMetadata struct {
+		Resource             string   `json:"resource"`
+		AuthorizationServers []string `json:"authorization_servers"`
+	}
+	resourceStatus, err := r.getJSON(ctx, report.ResourceMetadataURL, &resourceMetadata)
+	if err != nil {
+		return report, fmt.Errorf("fetch resource metadata: %w", err)
+	}
+	report.ResourceMetadataStatus = resourceStatus
+	report.Resource = strings.TrimSpace(resourceMetadata.Resource)
+	if len(resourceMetadata.AuthorizationServers) == 0 {
+		return report, errors.New("resource metadata did not include authorization_servers")
+	}
+	report.AuthorizationServer = strings.TrimSpace(resourceMetadata.AuthorizationServers[0])
+	report.AuthorizationMetadataURL, err = authorizationServerMetadataURL(report.AuthorizationServer)
+	if err != nil {
+		return report, err
+	}
+
+	var authorizationMetadata struct {
+		AuthorizationEndpoint         string   `json:"authorization_endpoint"`
+		TokenEndpoint                 string   `json:"token_endpoint"`
+		RegistrationEndpoint          string   `json:"registration_endpoint"`
+		CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported"`
+	}
+	authorizationStatus, err := r.getJSON(ctx, report.AuthorizationMetadataURL, &authorizationMetadata)
+	if err != nil {
+		return report, fmt.Errorf("fetch authorization server metadata: %w", err)
+	}
+	report.AuthorizationStatus = authorizationStatus
+	report.AuthorizationEndpoint = strings.TrimSpace(authorizationMetadata.AuthorizationEndpoint)
+	report.TokenEndpoint = strings.TrimSpace(authorizationMetadata.TokenEndpoint)
+	report.RegistrationEndpoint = strings.TrimSpace(authorizationMetadata.RegistrationEndpoint)
+	report.CodeChallengeMethodsCount = len(authorizationMetadata.CodeChallengeMethodsSupported)
+	return report, nil
+}
+
+// writeOAuthDiscoveryReport prints a concise OAuth discovery verdict for humans.
+//
+// Args:
+//
+//	report: Discovery report emitted by local probes.
+//	clientProfile: Optional client profile name used to add compatibility notes.
+//
+// Returns:
+//
+//	None. The report is written to stdout.
+func (r *Runner) writeOAuthDiscoveryReport(report oauthDiscoveryReport, clientProfile string) {
+	fmt.Fprintf(r.stdout, "OAuth debug for %s\n", report.TargetURL)
+	fmt.Fprintf(r.stdout, "MCP endpoint: %s\n", report.TargetStatus)
+	fmt.Fprintf(r.stdout, "Protected resource metadata: %s (%s)\n", report.ResourceMetadataURL, report.ResourceMetadataStatus)
+	fmt.Fprintf(r.stdout, "Resource: %s\n", report.Resource)
+	fmt.Fprintf(r.stdout, "Authorization server: %s\n", report.AuthorizationServer)
+	fmt.Fprintf(r.stdout, "Authorization metadata: %s (%s)\n", report.AuthorizationMetadataURL, report.AuthorizationStatus)
+	fmt.Fprintf(r.stdout, "Authorization endpoint: %s\n", report.AuthorizationEndpoint)
+	fmt.Fprintf(r.stdout, "Token endpoint: %s\n", report.TokenEndpoint)
+	if report.RegistrationEndpoint == "" {
+		fmt.Fprintln(r.stdout, "Dynamic client registration: not advertised")
+	} else {
+		fmt.Fprintf(r.stdout, "Dynamic client registration: %s\n", report.RegistrationEndpoint)
+	}
+	if strings.EqualFold(strings.TrimSpace(clientProfile), "chatgpt") && report.RegistrationEndpoint == "" {
+		fmt.Fprintln(r.stdout, "ChatGPT note: discovery succeeds, but clients that require DCR need a pre-registered OAuth client.")
+	}
+}
+
+// getJSON fetches one URL and decodes a JSON response body.
+//
+// Args:
+//
+//	ctx: Request context controlling the outbound HTTP request.
+//	targetURL: Absolute URL to fetch.
+//	out: Destination for decoded JSON.
+//
+// Returns:
+//
+//	The HTTP status string returned by the server.
+//
+// Errors:
+//
+//	Fails on request construction, transport errors, non-2xx status, or JSON decoding errors.
+func (r *Runner) getJSON(ctx context.Context, targetURL string, out any) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "mcpctl/dev")
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return resp.Status, httpStatusError{
+			URL:        targetURL,
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Body:       summarizeHTTPBody(string(limited)),
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return resp.Status, err
+	}
+	return resp.Status, nil
+}
+
+// extractResourceMetadataURL reads the RFC 9728 resource_metadata auth parameter.
+//
+// Args:
+//
+//	headers: All WWW-Authenticate header values returned by the MCP endpoint.
+//
+// Returns:
+//
+//	The first resource_metadata URL value, or an empty string when absent.
+func extractResourceMetadataURL(headers []string) string {
+	for _, header := range headers {
+		for _, part := range strings.Split(header, ",") {
+			key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if !ok {
+				continue
+			}
+			keyFields := strings.Fields(strings.TrimSpace(key))
+			if len(keyFields) > 0 {
+				key = keyFields[len(keyFields)-1]
+			}
+			if strings.TrimSpace(key) != "resource_metadata" {
+				continue
+			}
+			return strings.Trim(strings.TrimSpace(value), `"`)
+		}
+	}
+	return ""
+}
+
+// authorizationServerMetadataURL derives the RFC 8414 metadata URL for one issuer.
+//
+// Args:
+//
+//	issuerURL: Authorization server issuer URL from protected resource metadata.
+//
+// Returns:
+//
+//	The path-aware OAuth authorization server metadata URL.
+//
+// Errors:
+//
+//	Fails when the issuer URL is not absolute.
+func authorizationServerMetadataURL(issuerURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(issuerURL))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("authorization server must be absolute: %s", issuerURL)
+	}
+	issuerPath := strings.TrimRight(parsed.EscapedPath(), "/")
+	parsed.Path = "/.well-known/oauth-authorization-server"
+	if issuerPath != "" {
+		parsed.Path += issuerPath
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }
 
 // runInit writes the starter mcpctl.yaml config without overwriting by default.
@@ -728,6 +1160,48 @@ func (r *Runner) revokeToken(endpoint string, refreshToken string) error {
 //
 //	Returns endpoint, transport, status, or JSON decoding errors.
 func (r *Runner) postJSON(endpoint string, path string, payload any, out any) error {
+	return r.postJSONWithBearer(endpoint, path, "", payload, out)
+}
+
+// postAuthenticatedJSON sends a bearer-authenticated JSON POST and decodes the JSON response.
+//
+// Args:
+//
+//	endpoint: Base cloud endpoint URL.
+//	path: Absolute API path under the cloud endpoint.
+//	bearerToken: Operator bearer token value without the `Bearer ` prefix.
+//	payload: JSON-serializable request body.
+//	out: Destination for response JSON.
+//
+// Returns:
+//
+//	nil when the request succeeds with a 2xx response and JSON decodes into out.
+//
+// Errors:
+//
+//	Returns endpoint, transport, status, or JSON decoding errors.
+func (r *Runner) postAuthenticatedJSON(endpoint string, path string, bearerToken string, payload any, out any) error {
+	return r.postJSONWithBearer(endpoint, path, bearerToken, payload, out)
+}
+
+// postJSONWithBearer sends a JSON POST with optional bearer authentication.
+//
+// Args:
+//
+//	endpoint: Base cloud endpoint URL.
+//	path: Absolute API path under the cloud endpoint.
+//	bearerToken: Optional bearer token value; omitted for unauthenticated requests.
+//	payload: JSON-serializable request body.
+//	out: Destination for response JSON.
+//
+// Returns:
+//
+//	nil when the request succeeds with a 2xx response and JSON decodes into out.
+//
+// Errors:
+//
+//	Returns endpoint, transport, status, or JSON decoding errors.
+func (r *Runner) postJSONWithBearer(endpoint string, path string, bearerToken string, payload any, out any) error {
 	requestURL, err := joinEndpointPath(endpoint, path)
 	if err != nil {
 		return err
@@ -745,6 +1219,9 @@ func (r *Runner) postJSON(endpoint string, path string, payload any, out any) er
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "mcpctl/dev")
+	if strings.TrimSpace(bearerToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearerToken))
+	}
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -1055,7 +1532,7 @@ func (r *Runner) runVersion(args []string) int {
 //
 //	None. The function writes directly to the supplied writer.
 func (r *Runner) writeHelp(out io.Writer) {
-	commands := []string{"init", "dev", "inspect", "validate", "auth login", "auth status", "cloud ping", "report", "registry export", "doctor", "version"}
+	commands := []string{"init", "dev", "inspect", "validate", "debug oauth", "auth login", "auth status", "cloud ping", "report", "registry export", "doctor", "version"}
 	sort.Strings(commands)
 
 	fmt.Fprintln(out, "Usage: mcpctl <command> [flags]")
@@ -1064,6 +1541,22 @@ func (r *Runner) writeHelp(out io.Writer) {
 	for _, command := range commands {
 		fmt.Fprintf(out, "  %s\n", command)
 	}
+}
+
+// writeDebugHelp prints usage for hosted endpoint debugging commands.
+//
+// Args:
+//
+//	out: Destination for usage text.
+//
+// Returns:
+//
+//	None. The function writes directly to the supplied writer.
+func (r *Runner) writeDebugHelp(out io.Writer) {
+	fmt.Fprintln(out, "Usage: mcpctl debug <command> [flags]")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Commands:")
+	fmt.Fprintln(out, "  oauth  Run hosted OAuth discovery diagnostics for a remote MCP endpoint")
 }
 
 // writeCommandHelp prints usage for local developer-readiness commands.

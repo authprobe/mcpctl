@@ -94,7 +94,7 @@ func TestHelpListsPublicCommands(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 
-	for _, want := range []string{"init", "inspect", "validate", "auth login", "cloud ping", "registry export"} {
+	for _, want := range []string{"init", "inspect", "validate", "debug oauth", "auth login", "cloud ping", "registry export"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output %q missing %q", stdout.String(), want)
 		}
@@ -120,6 +120,7 @@ func TestLocalCommandHelpDescribesDeveloperQuestions(t *testing.T) {
 		{args: []string{"validate", "--help"}, want: "described clearly enough for agents"},
 		{args: []string{"auth", "login", "--help"}, want: "browser-based login"},
 		{args: []string{"cloud", "ping", "--help"}, want: "without logging in"},
+		{args: []string{"debug", "oauth", "--help"}, want: "OAuth discovery diagnostics"},
 	}
 
 	for _, tc := range cases {
@@ -676,6 +677,135 @@ func TestCloudPingUsesNoLoginEndpoint(t *testing.T) {
 	if !strings.Contains(stdout.String(), "reachable") {
 		t.Fatalf("stdout = %q, want reachable message", stdout.String())
 	}
+}
+
+// TestDebugOAuthCreatesHostedInspectRun verifies OAuth debugging calls the authenticated hosted inspect API.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when the CLI omits auth, sends the wrong probes, or hides the report URL.
+func TestDebugOAuthCreatesHostedInspectRun(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        "https://console.staging.mcpctl.io",
+			AccessToken: "operator-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	var gotAuth string
+	var gotPayload debugOAuthRunRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+externalURL(r, "/.well-known/oauth-protected-resource/mcp")+`"`)
+			http.Error(w, "missing token", http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/mcp":
+			writeJSON(t, w, map[string]any{
+				"resource":              externalURL(r, "/mcp"),
+				"authorization_servers": []string{externalURL(r, "/login/oauth")},
+			})
+		case "/.well-known/oauth-authorization-server/login/oauth":
+			writeJSON(t, w, map[string]any{
+				"authorization_endpoint":           externalURL(r, "/login/oauth/authorize"),
+				"token_endpoint":                   externalURL(r, "/login/oauth/access_token"),
+				"code_challenge_methods_supported": []string{"S256"},
+			})
+		case "/v1/operator/inspect/runs":
+			gotAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				t.Fatalf("Decode request body returned error: %v", err)
+			}
+			writeJSON(t, w, debugOAuthRunResponse{
+				RunID:     "irun_test",
+				Status:    "succeeded",
+				ReportURL: "https://console.staging.mcpctl.io/inspect/r/irun_test",
+			})
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{
+		"debug",
+		"oauth",
+		server.URL + "/mcp",
+		"--client",
+		"chatgpt",
+		"--share",
+		"-endpoint",
+		server.URL,
+	})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if gotAuth != "Bearer operator-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotPayload.EndpointURL != server.URL+"/mcp" {
+		t.Fatalf("EndpointURL = %q, want target URL", gotPayload.EndpointURL)
+	}
+	if gotPayload.TransportMode != "auto" {
+		t.Fatalf("TransportMode = %q, want auto", gotPayload.TransportMode)
+	}
+	for _, probe := range []string{"auth_discovery", "spec_compliance", "client_compatibility"} {
+		if !containsString(gotPayload.SelectedProbes, probe) {
+			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
+		}
+	}
+	if len(gotPayload.ClientProfiles) != 1 || gotPayload.ClientProfiles[0] != "chatgpt" {
+		t.Fatalf("ClientProfiles = %#v, want chatgpt", gotPayload.ClientProfiles)
+	}
+	for _, want := range []string{"OAuth debug", "Dynamic client registration: not advertised", "irun_test", "https://console.staging.mcpctl.io/inspect/r/irun_test"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+}
+
+// externalURL builds an absolute URL for the current httptest request host.
+//
+// Args:
+//
+//	r: Incoming request whose Host identifies the test server.
+//	path: Absolute path to attach to the server origin.
+//
+// Returns:
+//
+//	A test-server URL suitable for fixture payloads.
+func externalURL(r *http.Request, path string) string {
+	return "http://" + r.Host + path
+}
+
+// containsString reports whether a list includes one exact value.
+//
+// Args:
+//
+//	values: Candidate values from CLI output or request payloads.
+//	want: Exact value to find.
+//
+// Returns:
+//
+//	True when want appears in values.
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // writeJSON writes a JSON response for auth flow fixtures.
