@@ -21,13 +21,17 @@ import (
 )
 
 const (
-	configFileMode  = 0o644
-	exitOK          = 0
-	exitUsage       = 2
-	exitError       = 1
-	defaultCloud    = "https://console.mcpctl.io"
-	keychainService = "mcpctl"
-	keychainAccount = "mcpctl.io"
+	configFileMode    = 0o644
+	exitOK            = 0
+	exitUsage         = 2
+	exitError         = 1
+	defaultCloud      = "https://console.mcpctl.io"
+	stagingCloud      = "https://console.staging.mcpctl.io"
+	keychainService   = "mcpctl"
+	keychainAccount   = "mcpctl.io"
+	envCloudEndpoint  = "MCPCTL_ENDPOINT"
+	envCloudEndpoint2 = "MCPCTL_CLOUD_ENDPOINT"
+	envCloudProfile   = "MCPCTL_ENV"
 )
 
 var errCredentialNotFound = errors.New("credential not found")
@@ -359,6 +363,7 @@ func (r *Runner) runAuth(args []string) int {
 // Args:
 //
 //	args: Auth login flags; supports help, --endpoint, --web, and --with-token.
+//	Environment defaults may select staging or a custom endpoint when -endpoint is omitted.
 //
 // Returns:
 //
@@ -366,12 +371,12 @@ func (r *Runner) runAuth(args []string) int {
 func (r *Runner) runAuthLogin(args []string) int {
 	if len(args) > 0 && isHelp(args[0]) {
 		fmt.Fprintln(r.stdout, "Usage: mcpctl auth login [--web] [--with-token] [--insecure-storage] [-endpoint URL]")
-		fmt.Fprintf(r.stdout, "Start browser-based login for %s. Local commands do not require login.\n", defaultCloud)
+		fmt.Fprintf(r.stdout, "Start browser-based login for %s. Set MCPCTL_ENV=staging or MCPCTL_ENDPOINT to change it.\n", defaultCloudEndpoint())
 		return exitOK
 	}
 	flags := flag.NewFlagSet("auth login", flag.ContinueOnError)
 	flags.SetOutput(r.stderr)
-	endpoint := flags.String("endpoint", defaultCloud, "cloud endpoint for browser login")
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for browser login")
 	withToken := flags.Bool("with-token", false, "read a token from standard input for automation")
 	web := flags.Bool("web", true, "open browser-based login when available")
 	insecureStorage := flags.Bool("insecure-storage", false, "allow plaintext credential fallback when OS storage is unavailable")
@@ -389,7 +394,7 @@ func (r *Runner) runAuthLogin(args []string) int {
 		return r.runBrowserLogin(*endpoint, *web, *insecureStorage, false, nil)
 	}
 	reader := bufio.NewReader(r.stdin)
-	selectedEndpoint, ok := r.promptCloudHost(reader, *endpoint, hasFlag(args, "endpoint"))
+	selectedEndpoint, ok := r.promptCloudHost(reader, *endpoint, hasFlag(args, "endpoint") || cloudEndpointEnvProvided())
 	if !ok {
 		return exitError
 	}
@@ -446,7 +451,7 @@ func (r *Runner) runAuthStatus(args []string) int {
 //
 // Args:
 //
-//	args: Auth logout flags; no flags are currently accepted.
+//	args: Auth logout flags; -endpoint overrides the environment-selected cloud endpoint.
 //
 // Returns:
 //
@@ -458,7 +463,7 @@ func (r *Runner) runAuthLogout(args []string) int {
 	}
 	flags := flag.NewFlagSet("auth logout", flag.ContinueOnError)
 	flags.SetOutput(r.stderr)
-	endpoint := flags.String("endpoint", defaultCloud, "cloud endpoint for token revocation")
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for token revocation")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -779,13 +784,68 @@ func (e httpStatusError) Error() string {
 	return fmt.Sprintf("%s returned %s: %s", e.URL, e.Status, e.Body)
 }
 
+// defaultCloudEndpoint resolves the cloud endpoint selected by environment defaults.
+//
+// Args:
+//
+//	None. Reads MCPCTL_ENDPOINT, MCPCTL_CLOUD_ENDPOINT, and MCPCTL_ENV from the process environment.
+//
+// Returns:
+//
+//	The endpoint used by hosted commands when no -endpoint flag is provided.
+func defaultCloudEndpoint() string {
+	return resolveCloudEndpoint(os.Getenv)
+}
+
+// cloudEndpointEnvProvided reports whether an environment variable selected a hosted endpoint.
+//
+// Args:
+//
+//	None. Reads the public MCPCTL endpoint/profile environment variables.
+//
+// Returns:
+//
+//	True when login should use the environment-selected endpoint without an interactive host prompt.
+func cloudEndpointEnvProvided() bool {
+	return strings.TrimSpace(os.Getenv(envCloudEndpoint)) != "" ||
+		strings.TrimSpace(os.Getenv(envCloudEndpoint2)) != "" ||
+		strings.TrimSpace(os.Getenv(envCloudProfile)) != ""
+}
+
+// resolveCloudEndpoint maps explicit endpoint and profile environment values to a cloud URL.
+//
+// Args:
+//
+//	lookupEnv: Environment lookup function, usually os.Getenv; nil behaves like an empty environment.
+//
+// Returns:
+//
+//	The selected endpoint, defaulting to production unless a staging or custom endpoint is configured.
+func resolveCloudEndpoint(lookupEnv func(string) string) string {
+	if lookupEnv == nil {
+		lookupEnv = func(string) string { return "" }
+	}
+	if endpoint := strings.TrimRight(strings.TrimSpace(lookupEnv(envCloudEndpoint)), "/"); endpoint != "" {
+		return endpoint
+	}
+	if endpoint := strings.TrimRight(strings.TrimSpace(lookupEnv(envCloudEndpoint2)), "/"); endpoint != "" {
+		return endpoint
+	}
+	switch strings.ToLower(strings.TrimSpace(lookupEnv(envCloudProfile))) {
+	case "staging", "stage":
+		return stagingCloud
+	default:
+		return defaultCloud
+	}
+}
+
 // promptCloudHost asks interactive users which mcpctl cloud host they use.
 //
 // Args:
 //
 //	reader: Terminal input shared with later browser-confirmation prompts.
-//	endpoint: Default or flag-provided endpoint value.
-//	endpointProvided: Whether the endpoint was supplied on the command line.
+//	endpoint: Default, flag-provided, or environment-selected endpoint value.
+//	endpointProvided: Whether the endpoint was supplied by flag or environment.
 //
 // Returns:
 //
@@ -798,7 +858,8 @@ func (r *Runner) promptCloudHost(reader *bufio.Reader, endpoint string, endpoint
 
 	fmt.Fprintln(r.stdout, "? Where do you use mcpctl?")
 	fmt.Fprintln(r.stdout, "  1. mcpctl.io")
-	fmt.Fprintln(r.stdout, "  2. Other")
+	fmt.Fprintln(r.stdout, "  2. staging.mcpctl.io")
+	fmt.Fprintln(r.stdout, "  3. Other")
 	fmt.Fprint(r.stdout, "Select host [1]: ")
 	choice, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -809,7 +870,9 @@ func (r *Runner) promptCloudHost(reader *bufio.Reader, endpoint string, endpoint
 	switch strings.ToLower(strings.TrimSpace(choice)) {
 	case "", "1", "mcpctl.io", defaultCloud:
 		return defaultCloud, true
-	case "2", "other":
+	case "2", "staging", "stage", "staging.mcpctl.io", stagingCloud:
+		return stagingCloud, true
+	case "3", "other":
 		fmt.Fprint(r.stdout, "Enter mcpctl endpoint: ")
 		customEndpoint, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -873,7 +936,7 @@ func (r *Runner) runCloud(args []string) int {
 //
 // Args:
 //
-//	args: Flags for cloud ping; supports -endpoint and -timeout.
+//	args: Flags for cloud ping; supports -endpoint and -timeout, with environment endpoint defaults.
 //
 // Returns:
 //
@@ -890,7 +953,7 @@ func (r *Runner) runCloudPing(args []string) int {
 	}
 	flags := flag.NewFlagSet("cloud ping", flag.ContinueOnError)
 	flags.SetOutput(r.stderr)
-	endpoint := flags.String("endpoint", defaultCloud, "cloud endpoint to check")
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint to check")
 	timeout := flags.Duration("timeout", 5*time.Second, "maximum time to wait")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
@@ -916,15 +979,15 @@ func (r *Runner) runCloudPing(args []string) int {
 
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		fmt.Fprintf(r.stderr, "mcpctl.io is unreachable: %v\n", err)
+		fmt.Fprintf(r.stderr, "%s is unreachable: %v\n", strings.TrimRight(*endpoint, "/"), err)
 		return exitError
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusInternalServerError {
-		fmt.Fprintf(r.stderr, "mcpctl.io returned %s\n", resp.Status)
+		fmt.Fprintf(r.stderr, "%s returned %s\n", strings.TrimRight(*endpoint, "/"), resp.Status)
 		return exitError
 	}
-	fmt.Fprintf(r.stdout, "mcpctl.io reachable: %s\n", resp.Status)
+	fmt.Fprintf(r.stdout, "%s reachable: %s\n", strings.TrimRight(*endpoint, "/"), resp.Status)
 	return exitOK
 }
 

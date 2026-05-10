@@ -378,6 +378,40 @@ func TestAuthLoginCompletesDeviceFlow(t *testing.T) {
 	}
 }
 
+// TestResolveCloudEndpointSupportsStagingProfile verifies hosted commands can target staging by environment.
+//
+// Args:
+//
+//	t: Test handle used for endpoint resolution assertions.
+//
+// Returns:
+//
+//	None.
+//
+// Errors:
+//
+//	Fails when MCPCTL_ENV or MCPCTL_ENDPOINT does not select the expected endpoint.
+func TestResolveCloudEndpointSupportsStagingProfile(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{name: "default", env: map[string]string{}, want: defaultCloud},
+		{name: "staging profile", env: map[string]string{envCloudProfile: "staging"}, want: stagingCloud},
+		{name: "explicit endpoint", env: map[string]string{envCloudEndpoint: "https://console.preview.example/"}, want: "https://console.preview.example"},
+		{name: "legacy endpoint alias", env: map[string]string{envCloudEndpoint2: "https://console.alias.example/"}, want: "https://console.alias.example"},
+	}
+	for _, tc := range cases {
+		got := resolveCloudEndpoint(func(key string) string {
+			return tc.env[key]
+		})
+		if got != tc.want {
+			t.Fatalf("%s: resolveCloudEndpoint() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestAuthLoginInteractiveBrowserOnly verifies terminal login uses host and browser prompts.
 //
 // Args:

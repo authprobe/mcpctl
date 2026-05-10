@@ -84,12 +84,30 @@ For tests or private deployments:
 mcpctl cloud ping -endpoint https://console.mcpctl.io
 ```
 
+For staging:
+
+```sh
+MCPCTL_ENV=staging mcpctl cloud ping
+```
+
 ## Cloud Auth
 
 When a workflow needs hosted reports, compatibility runs, or shareable cloud results, authenticate with:
 
 ```sh
 mcpctl auth login
+```
+
+For staging, select the staging profile:
+
+```sh
+MCPCTL_ENV=staging mcpctl auth login
+```
+
+For private deployments or temporary environments, set an explicit endpoint:
+
+```sh
+MCPCTL_ENDPOINT=https://console.example.com mcpctl auth login
 ```
 
 The login model follows familiar browser-based CLI auth:
