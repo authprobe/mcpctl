@@ -153,38 +153,6 @@ type tokenAccount struct {
 	Login string `json:"login"`
 }
 
-// debugOAuthRunRequest is the hosted inspect payload for OAuth discovery debugging.
-//
-// Args:
-//
-//	None. Values are encoded into the cloud API request body.
-//
-// Returns:
-//
-//	The JSON shape accepted by `/v1/operator/inspect/runs`.
-type debugOAuthRunRequest struct {
-	EndpointURL    string   `json:"endpointUrl"`
-	TransportMode  string   `json:"transportMode"`
-	SelectedProbes []string `json:"selectedProbes"`
-	ClientProfiles []string `json:"clientProfiles,omitempty"`
-	SpecVersions   []string `json:"specVersions,omitempty"`
-}
-
-// debugOAuthRunResponse captures hosted inspect run creation results.
-//
-// Args:
-//
-//	None. Values are decoded from mcpctl.io JSON.
-//
-// Returns:
-//
-//	Run metadata including the shareable report URL.
-type debugOAuthRunResponse struct {
-	RunID     string `json:"run_id"`
-	Status    string `json:"status"`
-	ReportURL string `json:"report_url"`
-}
-
 // debugConnectRunRequest is the hosted compatibility lab payload for client connection debugging.
 //
 // Args:
@@ -479,7 +447,7 @@ func (r *Runner) createHostedCompatRun(endpoint string, targetURL string, client
 	return response, nil
 }
 
-// runDebugOAuth starts a hosted OAuth discovery/debug inspect run.
+// runDebugOAuth runs local OAuth discovery and optionally publishes a compatibility trace.
 //
 // Args:
 //
@@ -519,61 +487,19 @@ func (r *Runner) runDebugOAuth(args []string) int {
 	r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
 
 	if *share {
-		response, err := r.createHostedOAuthDebugRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile))
+		response, err := r.createHostedCompatRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile), "gateway", true)
 		if err != nil {
 			fmt.Fprintf(r.stderr, "warning: hosted share failed: %v\n", err)
 			return exitOK
 		}
-		fmt.Fprintf(r.stdout, "Hosted run: %s (%s)\n", response.RunID, response.Status)
+		fmt.Fprintf(r.stdout, "Compatibility run: %s (%s)\n", response.RunID, response.Status)
+		fmt.Fprintf(r.stdout, "Trace URL: %s\n", response.TraceURL)
 		fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
+		if strings.TrimSpace(response.GatewayURL) != "" {
+			fmt.Fprintf(r.stdout, "Gateway URL: %s\n", response.GatewayURL)
+		}
 	}
 	return exitOK
-}
-
-// createHostedOAuthDebugRun creates a shareable hosted inspect report for OAuth debugging.
-//
-// Args:
-//
-//	endpoint: Cloud endpoint that serves hosted inspect APIs.
-//	targetURL: Remote MCP endpoint to inspect.
-//	clientProfile: Optional client profile name such as `chatgpt`.
-//
-// Returns:
-//
-//	Created hosted run metadata with a report URL when available.
-//
-// Errors:
-//
-//	Fails when credentials are missing or the hosted inspect API rejects the run.
-func (r *Runner) createHostedOAuthDebugRun(endpoint string, targetURL string, clientProfile string) (debugOAuthRunResponse, error) {
-	credential, err := r.store.Load()
-	if err != nil {
-		if errors.Is(err, errCredentialNotFound) {
-			return debugOAuthRunResponse{}, errors.New("not authenticated; run `mcpctl auth login` before --share")
-		}
-		return debugOAuthRunResponse{}, fmt.Errorf("load cloud credentials: %w", err)
-	}
-	if strings.TrimSpace(credential.AccessToken) == "" {
-		return debugOAuthRunResponse{}, errors.New("stored cloud credential is missing an access token")
-	}
-	request := debugOAuthRunRequest{
-		EndpointURL:   targetURL,
-		TransportMode: "auto",
-		SelectedProbes: []string{
-			"auth_discovery",
-			"spec_compliance",
-			"client_compatibility",
-		},
-		SpecVersions: []string{"2025-11-25", "2025-06-18"},
-	}
-	if clientProfile != "" {
-		request.ClientProfiles = []string{clientProfile}
-	}
-	var response debugOAuthRunResponse
-	if err := r.postAuthenticatedJSON(endpoint, "/v1/operator/inspect/runs", credential.AccessToken, request, &response); err != nil {
-		return debugOAuthRunResponse{}, err
-	}
-	return response, nil
 }
 
 // reorderDebugOAuthArgs moves flags before positional targets for Go's flag parser.

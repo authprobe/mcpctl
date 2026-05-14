@@ -679,7 +679,7 @@ func TestCloudPingUsesNoLoginEndpoint(t *testing.T) {
 	}
 }
 
-// TestDebugOAuthCreatesHostedInspectRun verifies OAuth debugging calls the authenticated hosted inspect API.
+// TestDebugOAuthCreatesHostedCompatibilityRun verifies OAuth debugging publishes a compatibility trace.
 //
 // Args:
 //
@@ -687,8 +687,8 @@ func TestCloudPingUsesNoLoginEndpoint(t *testing.T) {
 //
 // Returns:
 //
-//	None. The test fails when the CLI omits auth, sends the wrong probes, or hides the report URL.
-func TestDebugOAuthCreatesHostedInspectRun(t *testing.T) {
+//	None. The test fails when the CLI omits auth, sends the wrong probes, or hides trace URLs.
+func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	store := &memoryCredentialStore{
@@ -701,7 +701,7 @@ func TestDebugOAuthCreatesHostedInspectRun(t *testing.T) {
 		},
 	}
 	var gotAuth string
-	var gotPayload debugOAuthRunRequest
+	var gotPayload debugConnectRunRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/mcp":
@@ -718,15 +718,17 @@ func TestDebugOAuthCreatesHostedInspectRun(t *testing.T) {
 				"token_endpoint":                   externalURL(r, "/login/oauth/access_token"),
 				"code_challenge_methods_supported": []string{"S256"},
 			})
-		case "/v1/operator/inspect/runs":
+		case "/v1/operator/compat/runs":
 			gotAuth = r.Header.Get("Authorization")
 			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
 				t.Fatalf("Decode request body returned error: %v", err)
 			}
-			writeJSON(t, w, debugOAuthRunResponse{
-				RunID:     "irun_test",
-				Status:    "succeeded",
-				ReportURL: "https://console.staging.mcpctl.io/inspect/r/irun_test",
+			writeJSON(t, w, debugConnectRunResponse{
+				RunID:      "crun_test",
+				Status:     "failed",
+				TraceURL:   "https://api.staging.mcpctl.io/compat/trace/crun_test/mcp/",
+				ReportURL:  "https://console.staging.mcpctl.io/compat/r/crun_test",
+				GatewayURL: "https://api.staging.mcpctl.io/compat/gateway/crun_test/mcp/",
 			})
 		default:
 			http.NotFound(w, r)
@@ -754,21 +756,28 @@ func TestDebugOAuthCreatesHostedInspectRun(t *testing.T) {
 	if gotAuth != "Bearer operator-token" {
 		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
 	}
-	if gotPayload.EndpointURL != server.URL+"/mcp" {
-		t.Fatalf("EndpointURL = %q, want target URL", gotPayload.EndpointURL)
+	if gotPayload.TargetURL != server.URL+"/mcp" {
+		t.Fatalf("TargetURL = %q, want target URL", gotPayload.TargetURL)
 	}
-	if gotPayload.TransportMode != "auto" {
-		t.Fatalf("TransportMode = %q, want auto", gotPayload.TransportMode)
+	if gotPayload.ClientProfile != "chatgpt" || gotPayload.Mode != "gateway" {
+		t.Fatalf("unexpected compat payload: %+v", gotPayload)
 	}
-	for _, probe := range []string{"auth_discovery", "spec_compliance", "client_compatibility"} {
+	if gotPayload.UpstreamMode != "proxy" || !gotPayload.Shareable {
+		t.Fatalf("unexpected upstream/share fields: %+v", gotPayload)
+	}
+	for _, probe := range []string{"oauth_discovery", "mcp_initialize", "tools_list"} {
 		if !containsString(gotPayload.SelectedProbes, probe) {
 			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
 		}
 	}
-	if len(gotPayload.ClientProfiles) != 1 || gotPayload.ClientProfiles[0] != "chatgpt" {
-		t.Fatalf("ClientProfiles = %#v, want chatgpt", gotPayload.ClientProfiles)
-	}
-	for _, want := range []string{"OAuth debug", "Dynamic client registration: not advertised", "irun_test", "https://console.staging.mcpctl.io/inspect/r/irun_test"} {
+	for _, want := range []string{
+		"OAuth debug",
+		"Dynamic client registration: not advertised",
+		"Compatibility run: crun_test (failed)",
+		"Trace URL:",
+		"https://console.staging.mcpctl.io/compat/r/crun_test",
+		"Gateway URL:",
+	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
 		}
