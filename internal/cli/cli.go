@@ -421,12 +421,12 @@ func (r *Runner) createHostedCompatRun(endpoint string, targetURL string, client
 	credential, err := r.store.Load()
 	if err != nil {
 		if errors.Is(err, errCredentialNotFound) {
-			return debugConnectRunResponse{}, errors.New("not authenticated; run `mcpctl auth login` before debug connect")
+			return debugConnectRunResponse{}, fmt.Errorf("not authenticated; run `%s` before creating hosted debug runs", authLoginCommandForEndpoint(endpoint))
 		}
 		return debugConnectRunResponse{}, fmt.Errorf("load cloud credentials: %w", err)
 	}
 	if strings.TrimSpace(credential.AccessToken) == "" {
-		return debugConnectRunResponse{}, errors.New("stored cloud credential is missing an access token")
+		return debugConnectRunResponse{}, fmt.Errorf("stored cloud credential is missing an access token; run `%s`", authLoginCommandForEndpoint(endpoint))
 	}
 	request := debugConnectRunRequest{
 		TargetURL:     targetURL,
@@ -442,9 +442,48 @@ func (r *Runner) createHostedCompatRun(endpoint string, targetURL string, client
 	}
 	var response debugConnectRunResponse
 	if err := r.postAuthenticatedJSON(endpoint, "/v1/operator/compat/runs", credential.AccessToken, request, &response); err != nil {
-		return debugConnectRunResponse{}, err
+		return debugConnectRunResponse{}, hostedCompatRunError(endpoint, err)
 	}
 	return response, nil
+}
+
+// hostedCompatRunError adds operator-login recovery guidance to hosted run failures.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint selected for the hosted compatibility run.
+//	err: Underlying hosted API error.
+//
+// Returns:
+//
+//	The original error, or a wrapped 401 error with an actionable login command.
+func hostedCompatRunError(endpoint string, err error) error {
+	var statusErr httpStatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("operator auth unauthorized; run `%s` and retry --share: %w", authLoginCommandForEndpoint(endpoint), err)
+	}
+	return err
+}
+
+// authLoginCommandForEndpoint returns the shortest login command for a cloud endpoint.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint selected by flags or environment defaults.
+//
+// Returns:
+//
+//	A command string suitable for CLI diagnostics.
+func authLoginCommandForEndpoint(endpoint string) string {
+	normalized := strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	switch normalized {
+	case stagingCloud:
+		return "MCPCTL_ENV=staging mcpctl auth login"
+	case "", defaultCloud:
+		return "mcpctl auth login"
+	default:
+		return fmt.Sprintf("mcpctl auth login -endpoint %s", normalized)
+	}
 }
 
 // runDebugOAuth runs local OAuth discovery and optionally publishes a compatibility trace.

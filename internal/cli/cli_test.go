@@ -784,6 +784,93 @@ func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 	}
 }
 
+// TestDebugOAuthShareUnauthorizedPrintsLoginHint verifies expired cloud auth is actionable.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when a hosted share 401 omits the environment-specific login command.
+func TestDebugOAuthShareUnauthorizedPrintsLoginHint(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        stagingCloud,
+			AccessToken: "expired-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+externalURL(r, "/.well-known/oauth-protected-resource/mcp")+`"`)
+			http.Error(w, "missing token", http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/mcp":
+			writeJSON(t, w, map[string]any{
+				"resource":              externalURL(r, "/mcp"),
+				"authorization_servers": []string{externalURL(r, "/login/oauth")},
+			})
+		case "/.well-known/oauth-authorization-server/login/oauth":
+			writeJSON(t, w, map[string]any{
+				"authorization_endpoint": externalURL(r, "/login/oauth/authorize"),
+				"token_endpoint":         externalURL(r, "/login/oauth/access_token"),
+			})
+		case "/v1/operator/compat/runs":
+			w.WriteHeader(http.StatusUnauthorized)
+			writeJSON(t, w, map[string]any{
+				"error": map[string]any{
+					"code":    "unauthorized",
+					"message": "operator auth unauthorized",
+				},
+			})
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{
+		"debug",
+		"oauth",
+		server.URL + "/mcp",
+		"--client",
+		"chatgpt",
+		"--share",
+		"-endpoint",
+		stagingCloud,
+	})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	for _, want := range []string{
+		"OAuth debug",
+		"ChatGPT note:",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+	for _, want := range []string{
+		"warning: hosted share failed:",
+		"operator auth unauthorized",
+		"run `MCPCTL_ENV=staging mcpctl auth login` and retry --share",
+		"401 Unauthorized",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q missing %q", stderr.String(), want)
+		}
+	}
+}
+
 // TestDebugConnectCreatesHostedCompatibilityRun verifies the CLI calls the managed compatibility API.
 //
 // Args:
