@@ -188,6 +188,21 @@ type debugConnectRunResponse struct {
 	GatewayURL string `json:"gateway_url,omitempty"`
 }
 
+// hostedMCPProbeResult summarizes a downstream probe sent through a hosted run URL.
+//
+// Args:
+//
+//	None. Values are derived from HTTP responses.
+//
+// Returns:
+//
+//	The struct contains printable status and session metadata.
+type hostedMCPProbeResult struct {
+	InitializeStatus string
+	ToolsListStatus  string
+	SessionID        string
+}
+
 // oauthDiscoveryReport records the local OAuth discovery chain for one MCP endpoint.
 //
 // Args:
@@ -391,11 +406,18 @@ func (r *Runner) runDebugConnect(args []string) int {
 		fmt.Fprintf(r.stderr, "debug connect failed: %v\n", err)
 		return exitError
 	}
+	probeResult, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
 	fmt.Fprintf(r.stdout, "Compatibility run: %s (%s)\n", response.RunID, response.Status)
 	fmt.Fprintf(r.stdout, "Trace URL: %s\n", response.TraceURL)
 	fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
 	if strings.TrimSpace(response.GatewayURL) != "" {
 		fmt.Fprintf(r.stdout, "Gateway URL: %s\n", response.GatewayURL)
+	}
+	if probeErr != nil {
+		fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
+	} else {
+		fmt.Fprintf(r.stdout, "MCP initialize: %s\n", probeResult.InitializeStatus)
+		fmt.Fprintf(r.stdout, "MCP tools/list: %s\n", probeResult.ToolsListStatus)
 	}
 	return exitOK
 }
@@ -486,6 +508,124 @@ func authLoginCommandForEndpoint(endpoint string) string {
 	}
 }
 
+// runHostedMCPProbeTraffic sends real downstream MCP requests through a hosted run URL.
+//
+// Args:
+//
+//	response: Hosted compatibility run metadata containing trace and gateway URLs.
+//	clientProfile: Client profile name to place in the initialize clientInfo.
+//
+// Returns:
+//
+//	HTTP status summaries for initialize and tools/list.
+//
+// Errors:
+//
+//	Fails when the hosted run omitted a usable URL or either HTTP request cannot be completed.
+func (r *Runner) runHostedMCPProbeTraffic(response debugConnectRunResponse, clientProfile string) (hostedMCPProbeResult, error) {
+	probeURL := strings.TrimSpace(response.GatewayURL)
+	if probeURL == "" {
+		probeURL = strings.TrimSpace(response.TraceURL)
+	}
+	if probeURL == "" {
+		return hostedMCPProbeResult{}, errors.New("hosted run did not return a trace or gateway URL")
+	}
+	initializeResp, initializeBody, err := r.postMCPJSON(probeURL, hostedMCPInitializePayload(clientProfile), "")
+	if err != nil {
+		return hostedMCPProbeResult{}, fmt.Errorf("initialize: %w", err)
+	}
+	defer initializeResp.Body.Close()
+	sessionID := strings.TrimSpace(initializeResp.Header.Get("Mcp-Session-Id"))
+	if initializeResp.StatusCode < http.StatusOK || initializeResp.StatusCode >= http.StatusMultipleChoices {
+		return hostedMCPProbeResult{InitializeStatus: initializeResp.Status}, fmt.Errorf("initialize returned %s: %s", initializeResp.Status, summarizeHTTPBody(string(initializeBody)))
+	}
+	toolsResp, toolsBody, err := r.postMCPJSON(probeURL, hostedMCPToolsListPayload(), sessionID)
+	if err != nil {
+		return hostedMCPProbeResult{InitializeStatus: initializeResp.Status, SessionID: sessionID}, fmt.Errorf("tools/list: %w", err)
+	}
+	defer toolsResp.Body.Close()
+	result := hostedMCPProbeResult{
+		InitializeStatus: initializeResp.Status,
+		ToolsListStatus:  toolsResp.Status,
+		SessionID:        sessionID,
+	}
+	if toolsResp.StatusCode < http.StatusOK || toolsResp.StatusCode >= http.StatusMultipleChoices {
+		return result, fmt.Errorf("tools/list returned %s: %s", toolsResp.Status, summarizeHTTPBody(string(toolsBody)))
+	}
+	return result, nil
+}
+
+// postMCPJSON posts one JSON-RPC request to a hosted trace or gateway URL.
+//
+// Args:
+//
+//	probeURL: Trace or gateway URL returned by the hosted run.
+//	payload: JSON-RPC request body.
+//	sessionID: Optional MCP session id from initialize.
+//
+// Returns:
+//
+//	HTTP response plus a bounded response body copy for status handling.
+//
+// Errors:
+//
+//	Fails when the URL is invalid or the HTTP request cannot be sent.
+func (r *Runner) postMCPJSON(probeURL string, payload string, sessionID string) (*http.Response, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, probeURL, strings.NewReader(payload))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "mcpctl/dev")
+	if strings.TrimSpace(sessionID) != "" {
+		req.Header.Set("Mcp-Session-Id", strings.TrimSpace(sessionID))
+	}
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil {
+		_ = resp.Body.Close()
+		return nil, nil, readErr
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, body, nil
+}
+
+// hostedMCPInitializePayload builds a downstream initialize request for hosted tracing.
+//
+// Args:
+//
+//	clientProfile: Client profile name to place in clientInfo.
+//
+// Returns:
+//
+//	A compact JSON-RPC initialize payload.
+func hostedMCPInitializePayload(clientProfile string) string {
+	clientName := strings.TrimSuffix(strings.TrimSpace(clientProfile), "/latest")
+	if clientName == "" {
+		clientName = "mcpctl"
+	}
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":%q,"version":"mcpctl-debug"}}}`, clientName)
+}
+
+// hostedMCPToolsListPayload builds a downstream tools/list request for hosted tracing.
+//
+// Args:
+//
+//	None.
+//
+// Returns:
+//
+//	A compact JSON-RPC tools/list payload.
+func hostedMCPToolsListPayload() string {
+	return `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`
+}
+
 // runDebugOAuth runs local OAuth discovery and optionally publishes a compatibility trace.
 //
 // Args:
@@ -531,11 +671,18 @@ func (r *Runner) runDebugOAuth(args []string) int {
 			fmt.Fprintf(r.stderr, "warning: hosted share failed: %v\n", err)
 			return exitOK
 		}
+		probeResult, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
 		fmt.Fprintf(r.stdout, "Compatibility run: %s (%s)\n", response.RunID, response.Status)
 		fmt.Fprintf(r.stdout, "Trace URL: %s\n", response.TraceURL)
 		fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
 		if strings.TrimSpace(response.GatewayURL) != "" {
 			fmt.Fprintf(r.stdout, "Gateway URL: %s\n", response.GatewayURL)
+		}
+		if probeErr != nil {
+			fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
+		} else {
+			fmt.Fprintf(r.stdout, "MCP initialize: %s\n", probeResult.InitializeStatus)
+			fmt.Fprintf(r.stdout, "MCP tools/list: %s\n", probeResult.ToolsListStatus)
 		}
 	}
 	return exitOK

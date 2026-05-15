@@ -702,6 +702,7 @@ func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 	}
 	var gotAuth string
 	var gotPayload debugConnectRunRequest
+	var gotMCPMethods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/mcp":
@@ -726,9 +727,33 @@ func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 			writeJSON(t, w, debugConnectRunResponse{
 				RunID:      "crun_test",
 				Status:     "failed",
-				TraceURL:   "https://api.staging.mcpctl.io/compat/trace/crun_test/mcp/",
+				TraceURL:   externalURL(r, "/compat/trace/crun_test/mcp/"),
 				ReportURL:  "https://console.staging.mcpctl.io/compat/r/crun_test",
-				GatewayURL: "https://api.staging.mcpctl.io/compat/gateway/crun_test/mcp/",
+				GatewayURL: externalURL(r, "/compat/gateway/crun_test/mcp/"),
+			})
+		case "/compat/gateway/crun_test/mcp/":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("Decode MCP probe body returned error: %v", err)
+			}
+			method, _ := payload["method"].(string)
+			gotMCPMethods = append(gotMCPMethods, method)
+			if method == "initialize" {
+				w.Header().Set("Mcp-Session-Id", "session-test")
+				writeJSON(t, w, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      1,
+					"result":  map[string]any{"protocolVersion": "2025-11-25"},
+				})
+				return
+			}
+			if r.Header.Get("Mcp-Session-Id") != "session-test" {
+				t.Fatalf("tools/list Mcp-Session-Id = %q, want session-test", r.Header.Get("Mcp-Session-Id"))
+			}
+			writeJSON(t, w, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      2,
+				"result":  map[string]any{"tools": []any{}},
 			})
 		default:
 			http.NotFound(w, r)
@@ -765,6 +790,9 @@ func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 	if gotPayload.UpstreamMode != "proxy" || !gotPayload.Shareable {
 		t.Fatalf("unexpected upstream/share fields: %+v", gotPayload)
 	}
+	if strings.Join(gotMCPMethods, ",") != "initialize,tools/list" {
+		t.Fatalf("MCP probe methods = %#v, want initialize then tools/list", gotMCPMethods)
+	}
 	for _, probe := range []string{"oauth_discovery", "mcp_initialize", "tools_list"} {
 		if !containsString(gotPayload.SelectedProbes, probe) {
 			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
@@ -777,6 +805,8 @@ func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 		"Trace URL:",
 		"https://console.staging.mcpctl.io/compat/r/crun_test",
 		"Gateway URL:",
+		"MCP initialize: 200 OK",
+		"MCP tools/list: 200 OK",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
@@ -894,6 +924,7 @@ func TestDebugConnectCreatesHostedCompatibilityRun(t *testing.T) {
 	}
 	var gotAuth string
 	var gotPayload debugConnectRunRequest
+	var gotMCPMethods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/operator/compat/runs":
@@ -904,9 +935,33 @@ func TestDebugConnectCreatesHostedCompatibilityRun(t *testing.T) {
 			writeJSON(t, w, debugConnectRunResponse{
 				RunID:      "crun_test",
 				Status:     "failed",
-				TraceURL:   "https://console.staging.mcpctl.io/compat/trace/crun_test/mcp/",
+				TraceURL:   externalURL(r, "/compat/trace/crun_test/mcp/"),
 				ReportURL:  "https://console.staging.mcpctl.io/compat/r/crun_test",
-				GatewayURL: "https://console.staging.mcpctl.io/compat/gateway/crun_test/mcp/",
+				GatewayURL: externalURL(r, "/compat/gateway/crun_test/mcp/"),
+			})
+		case "/compat/gateway/crun_test/mcp/":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("Decode MCP probe body returned error: %v", err)
+			}
+			method, _ := payload["method"].(string)
+			gotMCPMethods = append(gotMCPMethods, method)
+			if method == "initialize" {
+				w.Header().Set("Mcp-Session-Id", "session-test")
+				writeJSON(t, w, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      1,
+					"result":  map[string]any{"protocolVersion": "2025-11-25"},
+				})
+				return
+			}
+			if r.Header.Get("Mcp-Session-Id") != "session-test" {
+				t.Fatalf("tools/list Mcp-Session-Id = %q, want session-test", r.Header.Get("Mcp-Session-Id"))
+			}
+			writeJSON(t, w, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      2,
+				"result":  map[string]any{"tools": []any{}},
 			})
 		default:
 			http.NotFound(w, r)
@@ -942,12 +997,15 @@ func TestDebugConnectCreatesHostedCompatibilityRun(t *testing.T) {
 	if gotPayload.UpstreamMode != "proxy" || !gotPayload.Shareable {
 		t.Fatalf("unexpected upstream/share fields: %+v", gotPayload)
 	}
+	if strings.Join(gotMCPMethods, ",") != "initialize,tools/list" {
+		t.Fatalf("MCP probe methods = %#v, want initialize then tools/list", gotMCPMethods)
+	}
 	for _, probe := range []string{"oauth_discovery", "mcp_initialize", "tools_list"} {
 		if !containsString(gotPayload.SelectedProbes, probe) {
 			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
 		}
 	}
-	for _, want := range []string{"Compatibility run: crun_test (failed)", "Trace URL:", "Report:", "Gateway URL:"} {
+	for _, want := range []string{"Compatibility run: crun_test (failed)", "Trace URL:", "Report:", "Gateway URL:", "MCP initialize: 200 OK", "MCP tools/list: 200 OK"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
 		}
