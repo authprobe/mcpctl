@@ -17,7 +17,11 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 const (
@@ -32,6 +36,7 @@ const (
 	envCloudEndpoint  = "MCPCTL_ENDPOINT"
 	envCloudEndpoint2 = "MCPCTL_CLOUD_ENDPOINT"
 	envCloudProfile   = "MCPCTL_ENV"
+	tunnelConfigMode  = 0o600
 )
 
 var errCredentialNotFound = errors.New("credential not found")
@@ -153,6 +158,173 @@ type tokenAccount struct {
 	Login string `json:"login"`
 }
 
+// debugConnectRunRequest is the hosted compatibility lab payload for client connection debugging.
+//
+// Args:
+//
+//	None. Values are encoded into the cloud API request body.
+//
+// Returns:
+//
+//	The JSON shape accepted by `/v1/operator/compat/runs`.
+type debugConnectRunRequest struct {
+	TargetURL      string   `json:"target_url"`
+	ClientProfile  string   `json:"client_profile,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
+	UpstreamMode   string   `json:"upstream_mode,omitempty"`
+	SelectedProbes []string `json:"selected_probes,omitempty"`
+	Shareable      bool     `json:"shareable"`
+}
+
+// debugConnectRunResponse captures compatibility lab run creation results.
+//
+// Args:
+//
+//	None. Values are decoded from mcpctl.io JSON.
+//
+// Returns:
+//
+//	Run metadata including trace, report, and optional gateway URLs.
+type debugConnectRunResponse struct {
+	RunID      string `json:"run_id"`
+	Status     string `json:"status"`
+	TraceURL   string `json:"trace_url"`
+	ReportURL  string `json:"report_url"`
+	GatewayURL string `json:"gateway_url,omitempty"`
+}
+
+// tunnelCreateRequest is the managed tunnel registration payload.
+//
+// Args:
+//
+//	None. Values are encoded into the cloud API request body.
+//
+// Returns:
+//
+//	The JSON shape accepted by the tunnel registration API.
+type tunnelCreateRequest struct {
+	Name             string `json:"name"`
+	EnvironmentLabel string `json:"environment_label,omitempty"`
+}
+
+// tunnelResponse captures managed tunnel metadata returned by mcpctl.io.
+//
+// Args:
+//
+//	None. Values are decoded from mcpctl.io JSON.
+//
+// Returns:
+//
+//	Tunnel connection metadata including server id, gateway URL, and optional token.
+type tunnelResponse struct {
+	TunnelID   string `json:"tunnel_id"`
+	ServerID   string `json:"server_id"`
+	GatewayURL string `json:"gateway_url"`
+	ConnectURL string `json:"connect_url"`
+	Token      string `json:"token,omitempty"`
+	Status     string `json:"status"`
+}
+
+// tunnelListResponse captures the managed tunnel list response.
+//
+// Args:
+//
+//	None. Values are decoded from mcpctl.io JSON.
+//
+// Returns:
+//
+//	A list of registered tunnels visible to the authenticated account.
+type tunnelListResponse struct {
+	Tunnels []tunnelResponse `json:"tunnels"`
+}
+
+// tunnelFrame is the JSON envelope exchanged with mcpctl.io tunnel WebSockets.
+//
+// Args:
+//
+//	None. Values are decoded from and encoded to the WebSocket.
+//
+// Returns:
+//
+//	One request, response, heartbeat, or error frame for the active tunnel.
+type tunnelFrame struct {
+	Type      string            `json:"type"`
+	RequestID string            `json:"request_id,omitempty"`
+	ServerID  string            `json:"server_id,omitempty"`
+	Payload   json.RawMessage   `json:"payload,omitempty"`
+	Error     *tunnelFrameError `json:"error,omitempty"`
+}
+
+// tunnelFrameError is a protocol-shaped failure sent over the tunnel.
+//
+// Args:
+//
+//	None. Values are serialized in a tunnel error frame.
+//
+// Returns:
+//
+//	Stable error code and human-readable message.
+type tunnelFrameError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// tunnelRunConfig stores optional file-based tunnel run settings.
+//
+// Args:
+//
+//	None. Values are decoded from JSON config files.
+//
+// Returns:
+//
+//	Tunnel credential metadata plus an optional local command.
+type tunnelRunConfig struct {
+	TunnelID   string   `json:"tunnel_id"`
+	ServerID   string   `json:"server_id"`
+	ConnectURL string   `json:"connect_url"`
+	Token      string   `json:"token"`
+	Command    []string `json:"command"`
+}
+
+// hostedMCPProbeResult summarizes a downstream probe sent through a hosted run URL.
+//
+// Args:
+//
+//	None. Values are derived from HTTP responses.
+//
+// Returns:
+//
+//	The struct contains printable status and session metadata.
+type hostedMCPProbeResult struct {
+	InitializeStatus string
+	ToolsListStatus  string
+	SessionID        string
+}
+
+// oauthDiscoveryReport records the local OAuth discovery chain for one MCP endpoint.
+//
+// Args:
+//
+//	None. Values are populated from HTTP probes.
+//
+// Returns:
+//
+//	A printable diagnostic summary of protected-resource and authorization-server metadata.
+type oauthDiscoveryReport struct {
+	TargetURL                 string
+	TargetStatus              string
+	ResourceMetadataURL       string
+	ResourceMetadataStatus    string
+	Resource                  string
+	AuthorizationServer       string
+	AuthorizationMetadataURL  string
+	AuthorizationStatus       string
+	AuthorizationEndpoint     string
+	TokenEndpoint             string
+	RegistrationEndpoint      string
+	CodeChallengeMethodsCount int
+}
+
 // httpStatusError reports non-success cloud responses without leaking large HTML bodies.
 //
 // Args:
@@ -253,6 +425,10 @@ func (r *Runner) Run(args []string) int {
 		return r.runAuth(args[1:])
 	case "cloud":
 		return r.runCloud(args[1:])
+	case "debug":
+		return r.runDebug(args[1:])
+	case "tunnel":
+		return r.runTunnel(args[1:])
 	case "login":
 		return r.runAuth(append([]string{"login"}, args[1:]...))
 	case "registry":
@@ -264,6 +440,929 @@ func (r *Runner) Run(args []string) int {
 		r.writeHelp(r.stderr)
 		return exitUsage
 	}
+}
+
+// runDebug dispatches hosted debugging command surfaces.
+//
+// Args:
+//
+//	args: Debug subcommand arguments after "debug".
+//
+// Returns:
+//
+//	Process-style exit code for debug command handling.
+func (r *Runner) runDebug(args []string) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		r.writeDebugHelp(r.stdout)
+		return exitOK
+	}
+	switch args[0] {
+	case "oauth":
+		return r.runDebugOAuth(args[1:])
+	case "connect":
+		return r.runDebugConnect(args[1:])
+	default:
+		fmt.Fprintf(r.stderr, "unknown debug command %q\n\n", args[0])
+		r.writeDebugHelp(r.stderr)
+		return exitUsage
+	}
+}
+
+// runTunnel dispatches private STDIO tunnel command surfaces.
+//
+// Args:
+//
+//	args: Tunnel subcommand arguments after "tunnel".
+//
+// Returns:
+//
+//	Process-style exit code for tunnel command handling.
+func (r *Runner) runTunnel(args []string) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		r.writeTunnelHelp(r.stdout)
+		return exitOK
+	}
+	switch args[0] {
+	case "create":
+		return r.runTunnelCreate(args[1:])
+	case "list":
+		return r.runTunnelList(args[1:])
+	case "status":
+		return r.runTunnelStatus(args[1:])
+	case "run":
+		return r.runTunnelRun(args[1:])
+	default:
+		fmt.Fprintf(r.stderr, "unknown tunnel command %q\n\n", args[0])
+		r.writeTunnelHelp(r.stderr)
+		return exitUsage
+	}
+}
+
+// runTunnelCreate registers a managed tunnel and stores its first connect token locally.
+//
+// Args:
+//
+//	args: Tunnel create flags; supports --name, --environment, and -endpoint.
+//
+// Returns:
+//
+//	Process-style exit code for tunnel registration.
+func (r *Runner) runTunnelCreate(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl tunnel create --name <name> [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Create a managed tunnel registration for a private STDIO MCP server.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("tunnel create", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for tunnel registration")
+	name := flags.String("name", "", "display name for the private MCP server")
+	environment := flags.String("environment", "", "optional environment label")
+	if err := flags.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *name == "" && flags.NArg() == 1 {
+		*name = flags.Arg(0)
+	}
+	if strings.TrimSpace(*name) == "" {
+		fmt.Fprintln(r.stderr, "tunnel create requires --name")
+		return exitUsage
+	}
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			fmt.Fprintf(r.stderr, "not authenticated; run `%s` before creating tunnels\n", authLoginCommandForEndpoint(*endpoint))
+			return exitError
+		}
+		fmt.Fprintf(r.stderr, "load cloud credentials: %v\n", err)
+		return exitError
+	}
+	var response tunnelResponse
+	if err := r.postAuthenticatedJSON(*endpoint, "/v1/operator/tunnels", credential.AccessToken, tunnelCreateRequest{Name: *name, EnvironmentLabel: *environment}, &response); err != nil {
+		fmt.Fprintf(r.stderr, "tunnel create failed: %v\n", err)
+		return exitError
+	}
+	if err := writeTunnelCredential(response); err != nil {
+		fmt.Fprintf(r.stderr, "failed to store tunnel credential: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(r.stdout, "Created tunnel %s for server %s.\n", response.TunnelID, response.ServerID)
+	if response.GatewayURL != "" {
+		fmt.Fprintf(r.stdout, "Gateway: %s\n", response.GatewayURL)
+	}
+	fmt.Fprintf(r.stdout, "Run: mcpctl tunnel run --server %s -- <command>\n", response.ServerID)
+	return exitOK
+}
+
+// runTunnelList prints tunnel registrations from mcpctl.io.
+//
+// Args:
+//
+//	args: Tunnel list flags; supports -endpoint.
+//
+// Returns:
+//
+//	Process-style exit code for list retrieval.
+func (r *Runner) runTunnelList(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl tunnel list [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "List managed tunnel registrations for the authenticated account.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("tunnel list", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for tunnel list")
+	if err := flags.Parse(args); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() > 0 {
+		fmt.Fprintf(r.stderr, "tunnel list does not accept arguments: %s\n", strings.Join(flags.Args(), " "))
+		return exitUsage
+	}
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			fmt.Fprintf(r.stderr, "not authenticated; run `%s` before listing tunnels\n", authLoginCommandForEndpoint(*endpoint))
+			return exitError
+		}
+		fmt.Fprintf(r.stderr, "load cloud credentials: %v\n", err)
+		return exitError
+	}
+	var response tunnelListResponse
+	if err := r.getAuthenticatedJSON(*endpoint, "/v1/operator/tunnels", credential.AccessToken, &response); err != nil {
+		fmt.Fprintf(r.stderr, "tunnel list failed: %v\n", err)
+		return exitError
+	}
+	if len(response.Tunnels) == 0 {
+		fmt.Fprintln(r.stdout, "No tunnels found.")
+		return exitOK
+	}
+	for _, tunnel := range response.Tunnels {
+		fmt.Fprintf(r.stdout, "%s\t%s\t%s\t%s\n", tunnel.TunnelID, tunnel.ServerID, tunnel.Status, tunnel.GatewayURL)
+	}
+	return exitOK
+}
+
+// runTunnelStatus prints one tunnel registration from mcpctl.io.
+//
+// Args:
+//
+//	args: Tunnel status flags plus a tunnel id; supports -endpoint.
+//
+// Returns:
+//
+//	Process-style exit code for status retrieval.
+func (r *Runner) runTunnelStatus(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl tunnel status <tunnel-id> [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Show managed status for one tunnel registration.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("tunnel status", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for tunnel status")
+	if err := flags.Parse(args); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() != 1 {
+		fmt.Fprintln(r.stderr, "tunnel status requires exactly one tunnel id")
+		return exitUsage
+	}
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			fmt.Fprintf(r.stderr, "not authenticated; run `%s` before checking tunnel status\n", authLoginCommandForEndpoint(*endpoint))
+			return exitError
+		}
+		fmt.Fprintf(r.stderr, "load cloud credentials: %v\n", err)
+		return exitError
+	}
+	var response tunnelResponse
+	path := "/v1/operator/tunnels/" + url.PathEscape(flags.Arg(0))
+	if err := r.getAuthenticatedJSON(*endpoint, path, credential.AccessToken, &response); err != nil {
+		fmt.Fprintf(r.stderr, "tunnel status failed: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(r.stdout, "Tunnel: %s\nServer: %s\nStatus: %s\nGateway: %s\n", response.TunnelID, response.ServerID, response.Status, response.GatewayURL)
+	return exitOK
+}
+
+// runTunnelRun launches a local STDIO MCP server and bridges it to mcpctl.io.
+//
+// Args:
+//
+//	args: Tunnel run flags plus a command after `--`.
+//
+// Returns:
+//
+//	Process-style exit code for tunnel startup and bridge execution.
+func (r *Runner) runTunnelRun(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl tunnel run --server <server-id> -- <command> [args...]")
+		fmt.Fprintln(r.stdout, "Run a local STDIO MCP server through an outbound managed tunnel.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("tunnel run", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	serverID := flags.String("server", "", "managed MCP server id returned by tunnel create")
+	configPath := flags.String("config", "", "optional tunnel config path")
+	if err := flags.Parse(args); err != nil {
+		return exitUsage
+	}
+	if strings.TrimSpace(*serverID) == "" && strings.TrimSpace(*configPath) == "" {
+		fmt.Fprintln(r.stderr, "tunnel run requires --server or --config")
+		return exitUsage
+	}
+	command := flags.Args()
+	config, err := loadTunnelRunConfig(strings.TrimSpace(*configPath), strings.TrimSpace(*serverID))
+	if err != nil {
+		fmt.Fprintf(r.stderr, "load tunnel config: %v\n", err)
+		return exitError
+	}
+	if len(command) == 0 {
+		command = config.Command
+	}
+	if len(command) == 0 {
+		fmt.Fprintln(r.stderr, "tunnel run requires a command after -- or command in --config")
+		return exitUsage
+	}
+	if err := r.runTunnelBridge(config, command); err != nil {
+		fmt.Fprintf(r.stderr, "tunnel run failed: %v\n", err)
+		return exitError
+	}
+	return exitOK
+}
+
+// runDebugConnect starts a managed compatibility lab run for one MCP endpoint and client profile.
+//
+// Args:
+//
+//	args: Flags plus one MCP endpoint URL; supports -endpoint, --client, --mode, and --share.
+//
+// Returns:
+//
+//	Process-style exit code indicating whether the compatibility run was created.
+func (r *Runner) runDebugConnect(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl debug connect <mcp-url> [--client name] [--mode trace|gateway] [--share] [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "       mcpctl debug connect --tunnel <tunnel-id> [--client name] [--share] [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Run a managed client compatibility check for a remote or tunneled MCP endpoint.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("debug connect", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for hosted debugging")
+	clientProfile := flags.String("client", "generic", "client compatibility profile, for example chatgpt")
+	mode := flags.String("mode", "trace", "compatibility run mode: trace or gateway")
+	share := flags.Bool("share", false, "request a shareable report URL")
+	tunnelID := flags.String("tunnel", "", "registered tunnel id to test through its managed gateway URL")
+	if err := flags.Parse(reorderDebugConnectArgs(args)); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() != 1 && strings.TrimSpace(*tunnelID) == "" {
+		fmt.Fprintln(r.stderr, "Usage: mcpctl debug connect <mcp-url> [--client name] [--mode trace|gateway] [--share] [-endpoint URL]")
+		return exitUsage
+	}
+	if flags.NArg() > 1 || (flags.NArg() == 1 && strings.TrimSpace(*tunnelID) != "") {
+		fmt.Fprintln(r.stderr, "debug connect accepts either <mcp-url> or --tunnel, not both")
+		return exitUsage
+	}
+	targetURL := ""
+	if flags.NArg() == 1 {
+		targetURL = strings.TrimSpace(flags.Arg(0))
+	}
+	if strings.TrimSpace(*tunnelID) != "" {
+		tunnel, err := r.loadManagedTunnel(*endpoint, strings.TrimSpace(*tunnelID))
+		if err != nil {
+			fmt.Fprintf(r.stderr, "debug connect failed: %v\n", err)
+			return exitError
+		}
+		targetURL = tunnel.GatewayURL
+	}
+	if _, err := url.ParseRequestURI(targetURL); err != nil {
+		fmt.Fprintf(r.stderr, "invalid MCP endpoint URL %q\n", targetURL)
+		return exitUsage
+	}
+	response, err := r.createHostedCompatRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile), strings.TrimSpace(*mode), *share)
+	if err != nil {
+		fmt.Fprintf(r.stderr, "debug connect failed: %v\n", err)
+		return exitError
+	}
+	_, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
+	r.writeHostedDebugSummary(response)
+	if probeErr != nil {
+		fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
+	}
+	return exitOK
+}
+
+// loadManagedTunnel fetches one managed tunnel row using stored cloud credentials.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint serving tunnel APIs.
+//	tunnelID: Opaque tunnel id to inspect.
+//
+// Returns:
+//
+//	Tunnel metadata including its managed gateway URL.
+//
+// Errors:
+//
+//	Fails when credentials are missing or the tunnel API rejects the lookup.
+func (r *Runner) loadManagedTunnel(endpoint string, tunnelID string) (tunnelResponse, error) {
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			return tunnelResponse{}, fmt.Errorf("not authenticated; run `%s` before loading tunnels", authLoginCommandForEndpoint(endpoint))
+		}
+		return tunnelResponse{}, fmt.Errorf("load cloud credentials: %w", err)
+	}
+	var response tunnelResponse
+	path := "/v1/operator/tunnels/" + url.PathEscape(strings.TrimSpace(tunnelID))
+	if err := r.getAuthenticatedJSON(endpoint, path, credential.AccessToken, &response); err != nil {
+		return tunnelResponse{}, err
+	}
+	if strings.TrimSpace(response.GatewayURL) == "" {
+		return tunnelResponse{}, errors.New("managed tunnel response did not include gateway_url")
+	}
+	return response, nil
+}
+
+// writeHostedDebugSummary prints the public handoff for one hosted debug capture.
+//
+// Args:
+//
+//	response: Hosted compatibility run metadata returned by mcpctl.io.
+//
+// Returns:
+//
+//	None. The report URL and durable-server handoff hint are written to stdout.
+func (r *Runner) writeHostedDebugSummary(response debugConnectRunResponse) {
+	fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
+	fmt.Fprintln(r.stdout, "This capture is saved in the Debug Inbox. Promote it from Debug Logs to create a managed MCP server with auth, gateway history, and repeatable diagnostics.")
+}
+
+// createHostedCompatRun creates a hosted compatibility lab run through mcpctl.io.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint serving compatibility APIs.
+//	targetURL: Remote MCP endpoint to test.
+//	clientProfile: Client compatibility profile id or alias.
+//	mode: Compatibility run mode, usually trace or gateway.
+//	shareable: Whether the report should be shareable.
+//
+// Returns:
+//
+//	Created compatibility run metadata with trace/report URLs.
+//
+// Errors:
+//
+//	Fails when credentials are missing or the compatibility API rejects the run.
+func (r *Runner) createHostedCompatRun(endpoint string, targetURL string, clientProfile string, mode string, shareable bool) (debugConnectRunResponse, error) {
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			return debugConnectRunResponse{}, fmt.Errorf("not authenticated; run `%s` before creating hosted debug runs", authLoginCommandForEndpoint(endpoint))
+		}
+		return debugConnectRunResponse{}, fmt.Errorf("load cloud credentials: %w", err)
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" {
+		return debugConnectRunResponse{}, fmt.Errorf("stored cloud credential is missing an access token; run `%s`", authLoginCommandForEndpoint(endpoint))
+	}
+	request := debugConnectRunRequest{
+		TargetURL:     targetURL,
+		ClientProfile: clientProfile,
+		Mode:          mode,
+		UpstreamMode:  "proxy",
+		SelectedProbes: []string{
+			"oauth_discovery",
+			"mcp_initialize",
+			"tools_list",
+		},
+		Shareable: shareable,
+	}
+	var response debugConnectRunResponse
+	if err := r.postAuthenticatedJSON(endpoint, "/v1/operator/compat/runs", credential.AccessToken, request, &response); err != nil {
+		return debugConnectRunResponse{}, hostedCompatRunError(endpoint, err)
+	}
+	return response, nil
+}
+
+// hostedCompatRunError adds operator-login recovery guidance to hosted run failures.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint selected for the hosted compatibility run.
+//	err: Underlying hosted API error.
+//
+// Returns:
+//
+//	The original error, or a wrapped 401 error with an actionable login command.
+func hostedCompatRunError(endpoint string, err error) error {
+	var statusErr httpStatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("operator auth unauthorized; run `%s` and retry --share: %w", authLoginCommandForEndpoint(endpoint), err)
+	}
+	return err
+}
+
+// authLoginCommandForEndpoint returns the shortest login command for a cloud endpoint.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint selected by flags or environment defaults.
+//
+// Returns:
+//
+//	A command string suitable for CLI diagnostics.
+func authLoginCommandForEndpoint(endpoint string) string {
+	normalized := strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	switch normalized {
+	case stagingCloud:
+		return "MCPCTL_ENV=staging mcpctl auth login"
+	case "", defaultCloud:
+		return "mcpctl auth login"
+	default:
+		return fmt.Sprintf("mcpctl auth login -endpoint %s", normalized)
+	}
+}
+
+// runHostedMCPProbeTraffic sends real downstream MCP requests through a hosted run URL.
+//
+// Args:
+//
+//	response: Hosted compatibility run metadata containing trace and gateway URLs.
+//	clientProfile: Client profile name to place in the initialize clientInfo.
+//
+// Returns:
+//
+//	HTTP status summaries for initialize and tools/list.
+//
+// Errors:
+//
+//	Fails when the hosted run omitted a usable URL or either HTTP request cannot be completed.
+func (r *Runner) runHostedMCPProbeTraffic(response debugConnectRunResponse, clientProfile string) (hostedMCPProbeResult, error) {
+	probeURL := strings.TrimSpace(response.GatewayURL)
+	if probeURL == "" {
+		probeURL = strings.TrimSpace(response.TraceURL)
+	}
+	if probeURL == "" {
+		return hostedMCPProbeResult{}, errors.New("hosted run did not return a trace or gateway URL")
+	}
+	initializeResp, initializeBody, err := r.postMCPJSON(probeURL, hostedMCPInitializePayload(clientProfile), "")
+	if err != nil {
+		return hostedMCPProbeResult{}, fmt.Errorf("initialize: %w", err)
+	}
+	defer initializeResp.Body.Close()
+	sessionID := strings.TrimSpace(initializeResp.Header.Get("Mcp-Session-Id"))
+	if initializeResp.StatusCode < http.StatusOK || initializeResp.StatusCode >= http.StatusMultipleChoices {
+		return hostedMCPProbeResult{InitializeStatus: initializeResp.Status}, fmt.Errorf("initialize returned %s: %s", initializeResp.Status, summarizeHTTPBody(string(initializeBody)))
+	}
+	toolsResp, toolsBody, err := r.postMCPJSON(probeURL, hostedMCPToolsListPayload(), sessionID)
+	if err != nil {
+		return hostedMCPProbeResult{InitializeStatus: initializeResp.Status, SessionID: sessionID}, fmt.Errorf("tools/list: %w", err)
+	}
+	defer toolsResp.Body.Close()
+	result := hostedMCPProbeResult{
+		InitializeStatus: initializeResp.Status,
+		ToolsListStatus:  toolsResp.Status,
+		SessionID:        sessionID,
+	}
+	if toolsResp.StatusCode < http.StatusOK || toolsResp.StatusCode >= http.StatusMultipleChoices {
+		return result, fmt.Errorf("tools/list returned %s: %s", toolsResp.Status, summarizeHTTPBody(string(toolsBody)))
+	}
+	return result, nil
+}
+
+// postMCPJSON posts one JSON-RPC request to a hosted trace or gateway URL.
+//
+// Args:
+//
+//	probeURL: Trace or gateway URL returned by the hosted run.
+//	payload: JSON-RPC request body.
+//	sessionID: Optional MCP session id from initialize.
+//
+// Returns:
+//
+//	HTTP response plus a bounded response body copy for status handling.
+//
+// Errors:
+//
+//	Fails when the URL is invalid or the HTTP request cannot be sent.
+func (r *Runner) postMCPJSON(probeURL string, payload string, sessionID string) (*http.Response, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, probeURL, strings.NewReader(payload))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "mcpctl/dev")
+	if strings.TrimSpace(sessionID) != "" {
+		req.Header.Set("Mcp-Session-Id", strings.TrimSpace(sessionID))
+	}
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil {
+		_ = resp.Body.Close()
+		return nil, nil, readErr
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, body, nil
+}
+
+// hostedMCPInitializePayload builds a downstream initialize request for hosted tracing.
+//
+// Args:
+//
+//	clientProfile: Client profile name to place in clientInfo.
+//
+// Returns:
+//
+//	A compact JSON-RPC initialize payload.
+func hostedMCPInitializePayload(clientProfile string) string {
+	clientName := strings.TrimSuffix(strings.TrimSpace(clientProfile), "/latest")
+	if clientName == "" {
+		clientName = "mcpctl"
+	}
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":%q,"version":"mcpctl-debug"}}}`, clientName)
+}
+
+// hostedMCPToolsListPayload builds a downstream tools/list request for hosted tracing.
+//
+// Args:
+//
+//	None.
+//
+// Returns:
+//
+//	A compact JSON-RPC tools/list payload.
+func hostedMCPToolsListPayload() string {
+	return `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`
+}
+
+// runDebugOAuth runs local OAuth discovery and optionally publishes a compatibility trace.
+//
+// Args:
+//
+//	args: Flags plus one MCP endpoint URL; supports -endpoint, --client, and --share.
+//
+// Returns:
+//
+//	Process-style exit code indicating whether the run was created.
+func (r *Runner) runDebugOAuth(args []string) int {
+	if len(args) > 0 && isHelp(args[0]) {
+		fmt.Fprintln(r.stdout, "Usage: mcpctl debug oauth <mcp-url> [--client name] [--share] [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Run hosted OAuth discovery diagnostics for a remote MCP endpoint.")
+		return exitOK
+	}
+	flags := flag.NewFlagSet("debug oauth", flag.ContinueOnError)
+	flags.SetOutput(r.stderr)
+	endpoint := flags.String("endpoint", defaultCloudEndpoint(), "cloud endpoint for hosted debugging")
+	clientProfile := flags.String("client", "", "client compatibility profile, for example chatgpt")
+	share := flags.Bool("share", false, "print the shareable report URL")
+	if err := flags.Parse(reorderDebugOAuthArgs(args)); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() != 1 {
+		fmt.Fprintln(r.stderr, "Usage: mcpctl debug oauth <mcp-url> [--client name] [--share] [-endpoint URL]")
+		return exitUsage
+	}
+	targetURL := strings.TrimSpace(flags.Arg(0))
+	if _, err := url.ParseRequestURI(targetURL); err != nil {
+		fmt.Fprintf(r.stderr, "invalid MCP endpoint URL %q\n", targetURL)
+		return exitUsage
+	}
+	report, err := r.runLocalOAuthDiscovery(targetURL)
+	if err != nil {
+		fmt.Fprintf(r.stderr, "debug oauth failed: %v\n", err)
+		return exitError
+	}
+	if !*share {
+		r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
+	}
+
+	if *share {
+		response, err := r.createHostedCompatRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile), "gateway", true)
+		if err != nil {
+			r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
+			fmt.Fprintf(r.stderr, "warning: hosted share failed: %v\n", err)
+			return exitOK
+		}
+		_, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
+		r.writeHostedDebugSummary(response)
+		if probeErr != nil {
+			fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
+		}
+	}
+	return exitOK
+}
+
+// reorderDebugOAuthArgs moves flags before positional targets for Go's flag parser.
+//
+// Args:
+//
+//	args: Raw `debug oauth` arguments, possibly with flags after the MCP URL.
+//
+// Returns:
+//
+//	Arguments with option tokens first and positional values last.
+func reorderDebugOAuthArgs(args []string) []string {
+	var flags []string
+	var positional []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+			if debugOAuthFlagNeedsValue(arg) && index+1 < len(args) {
+				index++
+				flags = append(flags, args[index])
+			}
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
+}
+
+// debugOAuthFlagNeedsValue reports whether a debug oauth flag consumes the next token.
+//
+// Args:
+//
+//	arg: Raw flag token, with either one or two leading dashes.
+//
+// Returns:
+//
+//	True when the flag expects a separate value token.
+func debugOAuthFlagNeedsValue(arg string) bool {
+	if strings.Contains(arg, "=") {
+		return false
+	}
+	switch strings.TrimLeft(arg, "-") {
+	case "client", "endpoint":
+		return true
+	default:
+		return false
+	}
+}
+
+// reorderDebugConnectArgs moves flags before the MCP endpoint for Go's flag parser.
+//
+// Args:
+//
+//	args: Raw `debug connect` arguments, possibly with flags after the MCP URL.
+//
+// Returns:
+//
+//	Arguments with option tokens first and positional values last.
+func reorderDebugConnectArgs(args []string) []string {
+	var flags []string
+	var positional []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+			if debugConnectFlagNeedsValue(arg) && index+1 < len(args) {
+				index++
+				flags = append(flags, args[index])
+			}
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
+}
+
+// debugConnectFlagNeedsValue reports whether a debug connect flag consumes the next token.
+//
+// Args:
+//
+//	arg: Raw flag token, with either one or two leading dashes.
+//
+// Returns:
+//
+//	True when the flag expects a separate value token.
+func debugConnectFlagNeedsValue(arg string) bool {
+	if strings.Contains(arg, "=") {
+		return false
+	}
+	switch strings.TrimLeft(arg, "-") {
+	case "client", "endpoint", "mode", "tunnel":
+		return true
+	default:
+		return false
+	}
+}
+
+// runLocalOAuthDiscovery follows the OAuth metadata chain advertised by one MCP endpoint.
+//
+// Args:
+//
+//	targetURL: Remote MCP endpoint URL to probe without credentials.
+//
+// Returns:
+//
+//	A discovery report containing status codes, metadata URLs, and OAuth endpoints.
+//
+// Errors:
+//
+//	Fails when the target cannot be fetched, omits resource metadata, or returns invalid metadata JSON.
+func (r *Runner) runLocalOAuthDiscovery(targetURL string) (oauthDiscoveryReport, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	targetReq, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return oauthDiscoveryReport{}, err
+	}
+	targetReq.Header.Set("Accept", "application/json")
+	targetReq.Header.Set("User-Agent", "mcpctl/dev")
+	targetResp, err := r.httpClient.Do(targetReq)
+	if err != nil {
+		return oauthDiscoveryReport{}, err
+	}
+	defer targetResp.Body.Close()
+
+	report := oauthDiscoveryReport{
+		TargetURL:           targetURL,
+		TargetStatus:        targetResp.Status,
+		ResourceMetadataURL: extractResourceMetadataURL(targetResp.Header.Values("WWW-Authenticate")),
+	}
+	if report.ResourceMetadataURL == "" {
+		return report, errors.New("target did not advertise resource_metadata in WWW-Authenticate")
+	}
+
+	var resourceMetadata struct {
+		Resource             string   `json:"resource"`
+		AuthorizationServers []string `json:"authorization_servers"`
+	}
+	resourceStatus, err := r.getJSON(ctx, report.ResourceMetadataURL, &resourceMetadata)
+	if err != nil {
+		return report, fmt.Errorf("fetch resource metadata: %w", err)
+	}
+	report.ResourceMetadataStatus = resourceStatus
+	report.Resource = strings.TrimSpace(resourceMetadata.Resource)
+	if len(resourceMetadata.AuthorizationServers) == 0 {
+		return report, errors.New("resource metadata did not include authorization_servers")
+	}
+	report.AuthorizationServer = strings.TrimSpace(resourceMetadata.AuthorizationServers[0])
+	report.AuthorizationMetadataURL, err = authorizationServerMetadataURL(report.AuthorizationServer)
+	if err != nil {
+		return report, err
+	}
+
+	var authorizationMetadata struct {
+		AuthorizationEndpoint         string   `json:"authorization_endpoint"`
+		TokenEndpoint                 string   `json:"token_endpoint"`
+		RegistrationEndpoint          string   `json:"registration_endpoint"`
+		CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported"`
+	}
+	authorizationStatus, err := r.getJSON(ctx, report.AuthorizationMetadataURL, &authorizationMetadata)
+	if err != nil {
+		return report, fmt.Errorf("fetch authorization server metadata: %w", err)
+	}
+	report.AuthorizationStatus = authorizationStatus
+	report.AuthorizationEndpoint = strings.TrimSpace(authorizationMetadata.AuthorizationEndpoint)
+	report.TokenEndpoint = strings.TrimSpace(authorizationMetadata.TokenEndpoint)
+	report.RegistrationEndpoint = strings.TrimSpace(authorizationMetadata.RegistrationEndpoint)
+	report.CodeChallengeMethodsCount = len(authorizationMetadata.CodeChallengeMethodsSupported)
+	return report, nil
+}
+
+// writeOAuthDiscoveryReport prints a concise OAuth discovery verdict for humans.
+//
+// Args:
+//
+//	report: Discovery report emitted by local probes.
+//	clientProfile: Optional client profile name used to add compatibility notes.
+//
+// Returns:
+//
+//	None. The report is written to stdout.
+func (r *Runner) writeOAuthDiscoveryReport(report oauthDiscoveryReport, clientProfile string) {
+	fmt.Fprintf(r.stdout, "OAuth debug for %s\n", report.TargetURL)
+	fmt.Fprintf(r.stdout, "MCP endpoint: %s\n", report.TargetStatus)
+	fmt.Fprintf(r.stdout, "Protected resource metadata: %s (%s)\n", report.ResourceMetadataURL, report.ResourceMetadataStatus)
+	fmt.Fprintf(r.stdout, "Resource: %s\n", report.Resource)
+	fmt.Fprintf(r.stdout, "Authorization server: %s\n", report.AuthorizationServer)
+	fmt.Fprintf(r.stdout, "Authorization metadata: %s (%s)\n", report.AuthorizationMetadataURL, report.AuthorizationStatus)
+	fmt.Fprintf(r.stdout, "Authorization endpoint: %s\n", report.AuthorizationEndpoint)
+	fmt.Fprintf(r.stdout, "Token endpoint: %s\n", report.TokenEndpoint)
+	if report.RegistrationEndpoint == "" {
+		fmt.Fprintln(r.stdout, "Dynamic client registration: not advertised")
+	} else {
+		fmt.Fprintf(r.stdout, "Dynamic client registration: %s\n", report.RegistrationEndpoint)
+	}
+	if strings.EqualFold(strings.TrimSpace(clientProfile), "chatgpt") && report.RegistrationEndpoint == "" {
+		fmt.Fprintln(r.stdout, "ChatGPT note: discovery succeeds, but clients that require DCR need a pre-registered OAuth client.")
+	}
+}
+
+// getJSON fetches one URL and decodes a JSON response body.
+//
+// Args:
+//
+//	ctx: Request context controlling the outbound HTTP request.
+//	targetURL: Absolute URL to fetch.
+//	out: Destination for decoded JSON.
+//
+// Returns:
+//
+//	The HTTP status string returned by the server.
+//
+// Errors:
+//
+//	Fails on request construction, transport errors, non-2xx status, or JSON decoding errors.
+func (r *Runner) getJSON(ctx context.Context, targetURL string, out any) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "mcpctl/dev")
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return resp.Status, httpStatusError{
+			URL:        targetURL,
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Body:       summarizeHTTPBody(string(limited)),
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return resp.Status, err
+	}
+	return resp.Status, nil
+}
+
+// extractResourceMetadataURL reads the RFC 9728 resource_metadata auth parameter.
+//
+// Args:
+//
+//	headers: All WWW-Authenticate header values returned by the MCP endpoint.
+//
+// Returns:
+//
+//	The first resource_metadata URL value, or an empty string when absent.
+func extractResourceMetadataURL(headers []string) string {
+	for _, header := range headers {
+		for _, part := range strings.Split(header, ",") {
+			key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if !ok {
+				continue
+			}
+			keyFields := strings.Fields(strings.TrimSpace(key))
+			if len(keyFields) > 0 {
+				key = keyFields[len(keyFields)-1]
+			}
+			if strings.TrimSpace(key) != "resource_metadata" {
+				continue
+			}
+			return strings.Trim(strings.TrimSpace(value), `"`)
+		}
+	}
+	return ""
+}
+
+// authorizationServerMetadataURL derives the RFC 8414 metadata URL for one issuer.
+//
+// Args:
+//
+//	issuerURL: Authorization server issuer URL from protected resource metadata.
+//
+// Returns:
+//
+//	The path-aware OAuth authorization server metadata URL.
+//
+// Errors:
+//
+//	Fails when the issuer URL is not absolute.
+func authorizationServerMetadataURL(issuerURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(issuerURL))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("authorization server must be absolute: %s", issuerURL)
+	}
+	issuerPath := strings.TrimRight(parsed.EscapedPath(), "/")
+	parsed.Path = "/.well-known/oauth-authorization-server"
+	if issuerPath != "" {
+		parsed.Path += issuerPath
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }
 
 // runInit writes the starter mcpctl.yaml config without overwriting by default.
@@ -728,23 +1827,62 @@ func (r *Runner) revokeToken(endpoint string, refreshToken string) error {
 //
 //	Returns endpoint, transport, status, or JSON decoding errors.
 func (r *Runner) postJSON(endpoint string, path string, payload any, out any) error {
+	return r.postJSONWithBearer(endpoint, path, "", payload, out)
+}
+
+// postAuthenticatedJSON sends a bearer-authenticated JSON POST and decodes the JSON response.
+//
+// Args:
+//
+//	endpoint: Base cloud endpoint URL.
+//	path: Absolute API path under the cloud endpoint.
+//	bearerToken: Operator bearer token value without the `Bearer ` prefix.
+//	payload: JSON-serializable request body.
+//	out: Destination for response JSON.
+//
+// Returns:
+//
+//	nil when the request succeeds with a 2xx response and JSON decodes into out.
+//
+// Errors:
+//
+//	Returns endpoint, transport, status, or JSON decoding errors.
+func (r *Runner) postAuthenticatedJSON(endpoint string, path string, bearerToken string, payload any, out any) error {
+	return r.postJSONWithBearer(endpoint, path, bearerToken, payload, out)
+}
+
+// getAuthenticatedJSON sends a bearer-authenticated JSON GET and decodes the JSON response.
+//
+// Args:
+//
+//	endpoint: Base cloud endpoint URL.
+//	path: Absolute API path under the cloud endpoint.
+//	bearerToken: Operator bearer token value without the `Bearer ` prefix.
+//	out: Destination for response JSON.
+//
+// Returns:
+//
+//	nil when the request succeeds with a 2xx response and JSON decodes into out.
+//
+// Errors:
+//
+//	Returns endpoint, transport, status, or JSON decoding errors.
+func (r *Runner) getAuthenticatedJSON(endpoint string, path string, bearerToken string, out any) error {
 	requestURL, err := joinEndpointPath(endpoint, path)
-	if err != nil {
-		return err
-	}
-	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "mcpctl/dev")
+	if strings.TrimSpace(bearerToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearerToken))
+	}
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -766,6 +1904,308 @@ func (r *Runner) postJSON(endpoint string, path string, payload any, out any) er
 		return err
 	}
 	return nil
+}
+
+// postJSONWithBearer sends a JSON POST with optional bearer authentication.
+//
+// Args:
+//
+//	endpoint: Base cloud endpoint URL.
+//	path: Absolute API path under the cloud endpoint.
+//	bearerToken: Optional bearer token value; omitted for unauthenticated requests.
+//	payload: JSON-serializable request body.
+//	out: Destination for response JSON.
+//
+// Returns:
+//
+//	nil when the request succeeds with a 2xx response and JSON decodes into out.
+//
+// Errors:
+//
+//	Returns endpoint, transport, status, or JSON decoding errors.
+func (r *Runner) postJSONWithBearer(endpoint string, path string, bearerToken string, payload any, out any) error {
+	requestURL, err := joinEndpointPath(endpoint, path)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "mcpctl/dev")
+	if strings.TrimSpace(bearerToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearerToken))
+	}
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return httpStatusError{
+			URL:        requestURL,
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Body:       summarizeHTTPBody(string(limited)),
+		}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeTunnelCredential stores a tunnel connect token in the user's config directory.
+//
+// Args:
+//
+//	response: Tunnel registration response containing tunnel id and token.
+//
+// Returns:
+//
+//	nil when the credential file is written, or nil when no token was returned.
+//
+// Errors:
+//
+//	Returns filesystem or JSON errors when the token cannot be stored securely.
+func writeTunnelCredential(response tunnelResponse) error {
+	if strings.TrimSpace(response.Token) == "" {
+		return nil
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(configDir, "mcpctl", "tunnels")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, strings.TrimSpace(response.TunnelID)+".json")
+	data, err := json.MarshalIndent(response, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), tunnelConfigMode)
+}
+
+// loadTunnelRunConfig loads stored tunnel credentials by server id or explicit config.
+//
+// Args:
+//
+//	configPath: Optional JSON config path supplied by --config.
+//	serverID: Optional server id returned by `mcpctl tunnel create`.
+//
+// Returns:
+//
+//	Tunnel run settings with connect URL and token populated.
+//
+// Errors:
+//
+//	Returns filesystem, JSON, or not-found errors when credentials cannot be loaded.
+func loadTunnelRunConfig(configPath string, serverID string) (tunnelRunConfig, error) {
+	if strings.TrimSpace(configPath) != "" {
+		return readTunnelRunConfig(configPath)
+	}
+	if strings.TrimSpace(serverID) == "" {
+		return tunnelRunConfig{}, errors.New("--server is required when --config is not supplied")
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return tunnelRunConfig{}, err
+	}
+	dir := filepath.Join(configDir, "mcpctl", "tunnels")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return tunnelRunConfig{}, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		cfg, err := readTunnelRunConfig(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(cfg.ServerID) == strings.TrimSpace(serverID) {
+			return cfg, nil
+		}
+	}
+	return tunnelRunConfig{}, fmt.Errorf("no stored tunnel credential for server %s; run `mcpctl tunnel create` first", strings.TrimSpace(serverID))
+}
+
+// readTunnelRunConfig decodes one stored tunnel JSON file.
+//
+// Args:
+//
+//	path: Absolute or relative JSON config file path.
+//
+// Returns:
+//
+//	Tunnel run settings normalized from either create response or config format.
+//
+// Errors:
+//
+//	Returns filesystem, JSON, or validation errors for unusable credentials.
+func readTunnelRunConfig(path string) (tunnelRunConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tunnelRunConfig{}, err
+	}
+	var cfg tunnelRunConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return tunnelRunConfig{}, err
+	}
+	if strings.TrimSpace(cfg.TunnelID) == "" || strings.TrimSpace(cfg.ServerID) == "" || strings.TrimSpace(cfg.ConnectURL) == "" || strings.TrimSpace(cfg.Token) == "" {
+		var response tunnelResponse
+		if err := json.Unmarshal(data, &response); err != nil {
+			return tunnelRunConfig{}, err
+		}
+		cfg = tunnelRunConfig{
+			TunnelID:   response.TunnelID,
+			ServerID:   response.ServerID,
+			ConnectURL: response.ConnectURL,
+			Token:      response.Token,
+		}
+	}
+	if strings.TrimSpace(cfg.ConnectURL) == "" || strings.TrimSpace(cfg.Token) == "" {
+		return tunnelRunConfig{}, errors.New("tunnel config is missing connect_url or token")
+	}
+	return cfg, nil
+}
+
+// runTunnelBridge connects to mcpctl.io and bridges WebSocket frames to STDIO.
+//
+// Args:
+//
+//	config: Tunnel credential and endpoint metadata.
+//	command: Local STDIO MCP server command and arguments.
+//
+// Returns:
+//
+//	nil when the tunnel exits cleanly.
+//
+// Errors:
+//
+//	Returns process, WebSocket, or frame routing errors.
+func (r *Runner) runTunnelBridge(config tunnelRunConfig, command []string) error {
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+	go func() {
+		_, _ = io.Copy(r.stderr, stderr)
+	}()
+	wsURL := strings.TrimSpace(config.ConnectURL)
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + strings.TrimSpace(config.Token)}},
+	})
+	if err != nil {
+		return err
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "mcpctl tunnel stopped")
+	fmt.Fprintf(r.stdout, "Tunnel connected: %s -> %s\n", strings.TrimSpace(config.TunnelID), strings.Join(command, " "))
+	return r.bridgeTunnelFrames(ctx, conn, strings.TrimSpace(config.ServerID), stdin, stdout)
+}
+
+// bridgeTunnelFrames serializes tunnel requests through one STDIO process.
+//
+// Args:
+//
+//	ctx: Bridge lifetime context.
+//	conn: Active WebSocket connection to mcpctl.io.
+//	serverID: Managed MCP server id expected on request frames.
+//	stdin: Local process stdin receiving JSON-RPC request lines.
+//	stdout: Local process stdout producing JSON-RPC response lines.
+//
+// Returns:
+//
+//	nil when the WebSocket closes normally.
+//
+// Errors:
+//
+//	Returns read/write failures from WebSocket or STDIO.
+func (r *Runner) bridgeTunnelFrames(ctx context.Context, conn *websocket.Conn, serverID string, stdin io.Writer, stdout io.Reader) error {
+	reader := bufio.NewReader(stdout)
+	var stdioMu sync.Mutex
+	for {
+		var frame tunnelFrame
+		if err := wsjson.Read(ctx, conn, &frame); err != nil {
+			return err
+		}
+		if frame.Type != "request" {
+			continue
+		}
+		if strings.TrimSpace(frame.ServerID) != "" && strings.TrimSpace(serverID) != "" && strings.TrimSpace(frame.ServerID) != strings.TrimSpace(serverID) {
+			if err := writeTunnelFrame(ctx, conn, tunnelFrame{Type: "error", RequestID: frame.RequestID, ServerID: serverID, Error: &tunnelFrameError{Code: "wrong_server", Message: "request was routed to the wrong tunnel server"}}); err != nil {
+				return err
+			}
+			continue
+		}
+		stdioMu.Lock()
+		_, writeErr := stdin.Write(append(append([]byte(nil), frame.Payload...), '\n'))
+		var response []byte
+		if writeErr == nil {
+			response, writeErr = reader.ReadBytes('\n')
+		}
+		stdioMu.Unlock()
+		if writeErr != nil {
+			if err := writeTunnelFrame(ctx, conn, tunnelFrame{Type: "error", RequestID: frame.RequestID, ServerID: serverID, Error: &tunnelFrameError{Code: "stdio_error", Message: writeErr.Error()}}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := writeTunnelFrame(ctx, conn, tunnelFrame{Type: "response", RequestID: frame.RequestID, ServerID: serverID, Payload: json.RawMessage(bytes.TrimSpace(response))}); err != nil {
+			return err
+		}
+	}
+}
+
+// writeTunnelFrame serializes one WebSocket frame to the cloud tunnel.
+//
+// Args:
+//
+//	ctx: Write deadline context.
+//	conn: Active WebSocket connection.
+//	frame: Response or error frame to send.
+//
+// Returns:
+//
+//	nil when the frame is written.
+//
+// Errors:
+//
+//	Returns WebSocket write failures.
+func writeTunnelFrame(ctx context.Context, conn *websocket.Conn, frame tunnelFrame) error {
+	return wsjson.Write(ctx, conn, frame)
 }
 
 // Error formats an HTTP status failure as a concise CLI diagnostic.
@@ -1055,7 +2495,7 @@ func (r *Runner) runVersion(args []string) int {
 //
 //	None. The function writes directly to the supplied writer.
 func (r *Runner) writeHelp(out io.Writer) {
-	commands := []string{"init", "dev", "inspect", "validate", "auth login", "auth status", "cloud ping", "report", "registry export", "doctor", "version"}
+	commands := []string{"init", "dev", "inspect", "validate", "debug connect", "debug oauth", "auth login", "auth status", "cloud ping", "report", "registry export", "tunnel", "doctor", "version"}
 	sort.Strings(commands)
 
 	fmt.Fprintln(out, "Usage: mcpctl <command> [flags]")
@@ -1064,6 +2504,42 @@ func (r *Runner) writeHelp(out io.Writer) {
 	for _, command := range commands {
 		fmt.Fprintf(out, "  %s\n", command)
 	}
+}
+
+// writeTunnelHelp prints usage for private STDIO tunnel commands.
+//
+// Args:
+//
+//	out: Destination for usage text.
+//
+// Returns:
+//
+//	None. The function writes directly to the supplied writer.
+func (r *Runner) writeTunnelHelp(out io.Writer) {
+	fmt.Fprintln(out, "Usage: mcpctl tunnel <command> [flags]")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Commands:")
+	fmt.Fprintln(out, "  create  Create a managed tunnel registration")
+	fmt.Fprintln(out, "  list    List managed tunnel registrations")
+	fmt.Fprintln(out, "  status  Show one tunnel registration")
+	fmt.Fprintln(out, "  run     Run a local STDIO MCP server through a tunnel")
+}
+
+// writeDebugHelp prints usage for hosted endpoint debugging commands.
+//
+// Args:
+//
+//	out: Destination for usage text.
+//
+// Returns:
+//
+//	None. The function writes directly to the supplied writer.
+func (r *Runner) writeDebugHelp(out io.Writer) {
+	fmt.Fprintln(out, "Usage: mcpctl debug <command> [flags]")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Commands:")
+	fmt.Fprintln(out, "  connect  Run a managed client compatibility check for a remote MCP endpoint")
+	fmt.Fprintln(out, "  oauth  Run hosted OAuth discovery diagnostics for a remote MCP endpoint")
 }
 
 // writeCommandHelp prints usage for local developer-readiness commands.

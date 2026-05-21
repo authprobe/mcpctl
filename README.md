@@ -90,6 +90,29 @@ For staging:
 MCPCTL_ENV=staging mcpctl cloud ping
 ```
 
+## OAuth Debugging
+
+`mcpctl debug oauth` checks the OAuth discovery chain for a remote MCP endpoint without requiring any separate scanner install.
+
+```sh
+mcpctl debug oauth https://api.githubcopilot.com/mcp/ --client chatgpt
+```
+
+The command verifies the unauthenticated MCP response, protected resource metadata, path-aware authorization server metadata, and client-profile notes such as missing dynamic client registration. Add `--share` after `mcpctl auth login` to publish a managed compatibility capture. Shared runs print one report URL; the capture also appears in the platform Debug Inbox, where it can be promoted into a managed MCP server when you want durable auth, gateway history, and repeated diagnostics.
+
+## STDIO MCP Tunnels
+
+Use `mcpctl tunnel` when your MCP server is a local or private STDIO process and you want managed compatibility checks, OAuth edge auth, and deep traces through `mcpctl.io`.
+
+```sh
+mcpctl auth login
+mcpctl tunnel create --name "local-tools"
+mcpctl tunnel run --server <server-id> -- node ./server.js
+mcpctl debug connect --tunnel <tunnel-id> --client claude --share
+```
+
+`mcpctl tunnel run` opens an outbound WebSocket, launches the command after `--`, and bridges managed JSON-RPC requests to the STDIO process. The public gateway URL and trace UI stay in mcpctl.io; the OSS CLI only owns local process launch and the tunnel transport.
+
 ## Cloud Auth
 
 When a workflow needs hosted reports, compatibility runs, or shareable cloud results, authenticate with:
@@ -134,6 +157,7 @@ mcpctl auth logout
 | `mcpctl dev` | Run or check a local MCP server. | No |
 | `mcpctl inspect` | Discover MCP tools, resources, prompts, schemas, and transport metadata. | No |
 | `mcpctl validate` | Check MCP tool descriptions and schemas for agent readiness. | No |
+| `mcpctl debug oauth` | Debug OAuth discovery for a remote MCP endpoint. | No |
 | `mcpctl cloud ping` | Check `mcpctl.io` reachability. | No |
 | `mcpctl auth login` | Connect the CLI to hosted workflows. | Browser approval |
 | `mcpctl auth status` | Show local cloud credential status. | No |

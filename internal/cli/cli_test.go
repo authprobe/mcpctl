@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +14,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 // memoryCredentialStore keeps credentials in memory for CLI auth tests.
@@ -94,7 +100,7 @@ func TestHelpListsPublicCommands(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 
-	for _, want := range []string{"init", "inspect", "validate", "auth login", "cloud ping", "registry export"} {
+	for _, want := range []string{"init", "inspect", "validate", "debug oauth", "auth login", "cloud ping", "registry export", "tunnel"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output %q missing %q", stdout.String(), want)
 		}
@@ -120,6 +126,10 @@ func TestLocalCommandHelpDescribesDeveloperQuestions(t *testing.T) {
 		{args: []string{"validate", "--help"}, want: "described clearly enough for agents"},
 		{args: []string{"auth", "login", "--help"}, want: "browser-based login"},
 		{args: []string{"cloud", "ping", "--help"}, want: "without logging in"},
+		{args: []string{"debug", "oauth", "--help"}, want: "OAuth discovery diagnostics"},
+		{args: []string{"tunnel", "--help"}, want: "managed tunnel"},
+		{args: []string{"tunnel", "create", "--help"}, want: "tunnel registration"},
+		{args: []string{"tunnel", "run", "--help"}, want: "STDIO MCP server"},
 	}
 
 	for _, tc := range cases {
@@ -131,6 +141,207 @@ func TestLocalCommandHelpDescribesDeveloperQuestions(t *testing.T) {
 		if !strings.Contains(stdout.String(), tc.want) {
 			t.Fatalf("Run(%v) output %q missing %q", tc.args, stdout.String(), tc.want)
 		}
+	}
+}
+
+// TestTunnelCreateCallsManagedAPI verifies tunnel creation reuses stored cloud auth.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when the CLI omits auth or misreads tunnel metadata.
+func TestTunnelCreateCallsManagedAPI(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tempHome, ".config"))
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        "https://console.staging.mcpctl.io",
+			AccessToken: "operator-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	var gotAuth string
+	var gotPayload tunnelCreateRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/operator/tunnels" {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("Decode request body returned error: %v", err)
+		}
+		writeJSON(t, w, tunnelResponse{
+			TunnelID:   "tun_test",
+			ServerID:   "mcp_srv_test",
+			GatewayURL: "https://gateway.example/mcp/mcp_srv_test",
+			ConnectURL: "wss://gateway.example/tunnel/connect?tunnel_id=tun_test",
+			Token:      "tun_secret",
+			Status:     "pending",
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+	code := runner.Run([]string{"tunnel", "create", "--name", "internal-db", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if gotAuth != "Bearer operator-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotPayload.Name != "internal-db" {
+		t.Fatalf("payload = %+v, want tunnel name", gotPayload)
+	}
+	if !strings.Contains(stdout.String(), "mcpctl tunnel run --server mcp_srv_test -- <command>") {
+		t.Fatalf("stdout = %q missing next command", stdout.String())
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir() error = %v", err)
+	}
+	credentialPath := filepath.Join(configDir, "mcpctl", "tunnels", "tun_test.json")
+	if _, err := os.Stat(credentialPath); err != nil {
+		t.Fatalf("expected tunnel credential at %s: %v", credentialPath, err)
+	}
+}
+
+// TestDebugConnectTunnelUsesGatewayURL verifies compatibility runs can target a managed tunnel.
+//
+// Args:
+//
+//	t: Test handle used for assertions and helper failures.
+//
+// Returns:
+//
+//	None. The test fails when --tunnel does not resolve through the cloud API.
+func TestDebugConnectTunnelUsesGatewayURL(t *testing.T) {
+	store := &memoryCredentialStore{credential: credentialRecord{AccessToken: "access-token"}, hasValue: true}
+	var gotTarget string
+	probeCount := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/operator/tunnels/tun_test":
+			if r.Header.Get("Authorization") != "Bearer access-token" {
+				t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+			}
+			writeJSON(t, w, tunnelResponse{TunnelID: "tun_test", ServerID: "mcp_srv_test", GatewayURL: server.URL + "/mcp"})
+		case "/v1/operator/compat/runs":
+			if r.Header.Get("Authorization") != "Bearer access-token" {
+				t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+			}
+			var payload debugConnectRunRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			gotTarget = payload.TargetURL
+			writeJSON(t, w, debugConnectRunResponse{RunID: "run_1", Status: "created", TraceURL: "https://trace", ReportURL: "https://report", GatewayURL: payload.TargetURL})
+		case "/mcp":
+			probeCount++
+			w.Header().Set("Mcp-Session-Id", "sess_1")
+			writeJSON(t, w, map[string]any{"jsonrpc": "2.0", "id": probeCount, "result": map[string]any{"ok": true}})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	runner := New(&stdout, &stderr)
+	runner.store = store
+	code := runner.Run([]string{"debug", "connect", "--tunnel", "tun_test", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("debug connect --tunnel code=%d stderr=%s", code, stderr.String())
+	}
+	if gotTarget != server.URL+"/mcp" {
+		t.Fatalf("target_url = %q, want tunnel gateway", gotTarget)
+	}
+}
+
+// TestBridgeTunnelFramesSerializesSTDIO verifies WebSocket request frames reach a STDIO process.
+//
+// Args:
+//
+//	t: Test handle used for assertions and helper failures.
+//
+// Returns:
+//
+//	None. The test fails when frame routing or response correlation regresses.
+func TestBridgeTunnelFramesSerializesSTDIO(t *testing.T) {
+	requestReceived := make(chan string, 1)
+	responseReceived := make(chan tunnelFrame, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		request := tunnelFrame{Type: "request", RequestID: "treq_1", ServerID: "mcp_srv_1", Payload: []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)}
+		if err := wsjson.Write(context.Background(), conn, request); err != nil {
+			t.Errorf("server write request: %v", err)
+			return
+		}
+		var response tunnelFrame
+		if err := wsjson.Read(context.Background(), conn, &response); err != nil {
+			t.Errorf("server read response: %v", err)
+			return
+		}
+		responseReceived <- response
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test done")
+	processInReader, processInWriter := io.Pipe()
+	processOutReader, processOutWriter := io.Pipe()
+	defer processInReader.Close()
+	defer processOutWriter.Close()
+	go func() {
+		line, _ := bufio.NewReader(processInReader).ReadString('\n')
+		requestReceived <- strings.TrimSpace(string(line))
+		_, _ = processOutWriter.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}` + "\n"))
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- New(io.Discard, io.Discard).bridgeTunnelFrames(context.Background(), conn, "mcp_srv_1", processInWriter, processOutReader)
+	}()
+
+	select {
+	case got := <-requestReceived:
+		if got != `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` {
+			t.Fatalf("stdio request = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for STDIO request")
+	}
+	select {
+	case response := <-responseReceived:
+		if response.Type != "response" || response.RequestID != "treq_1" || string(response.Payload) != `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}` {
+			t.Fatalf("response frame = %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for tunnel response")
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "done")
+	select {
+	case <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge did not exit after close")
 	}
 }
 
@@ -676,6 +887,377 @@ func TestCloudPingUsesNoLoginEndpoint(t *testing.T) {
 	if !strings.Contains(stdout.String(), "reachable") {
 		t.Fatalf("stdout = %q, want reachable message", stdout.String())
 	}
+}
+
+// TestDebugOAuthCreatesHostedCompatibilityRun verifies OAuth debugging publishes a compatibility trace.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when the CLI omits auth, sends the wrong probes, or hides trace URLs.
+func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        "https://console.staging.mcpctl.io",
+			AccessToken: "operator-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	var gotAuth string
+	var gotPayload debugConnectRunRequest
+	var gotMCPMethods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+externalURL(r, "/.well-known/oauth-protected-resource/mcp")+`"`)
+			http.Error(w, "missing token", http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/mcp":
+			writeJSON(t, w, map[string]any{
+				"resource":              externalURL(r, "/mcp"),
+				"authorization_servers": []string{externalURL(r, "/login/oauth")},
+			})
+		case "/.well-known/oauth-authorization-server/login/oauth":
+			writeJSON(t, w, map[string]any{
+				"authorization_endpoint":           externalURL(r, "/login/oauth/authorize"),
+				"token_endpoint":                   externalURL(r, "/login/oauth/access_token"),
+				"code_challenge_methods_supported": []string{"S256"},
+			})
+		case "/v1/operator/compat/runs":
+			gotAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				t.Fatalf("Decode request body returned error: %v", err)
+			}
+			writeJSON(t, w, debugConnectRunResponse{
+				RunID:      "crun_test",
+				Status:     "failed",
+				TraceURL:   externalURL(r, "/compat/trace/crun_test/mcp/"),
+				ReportURL:  "https://console.staging.mcpctl.io/compat/r/crun_test",
+				GatewayURL: externalURL(r, "/compat/gateway/crun_test/mcp/"),
+			})
+		case "/compat/gateway/crun_test/mcp/":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("Decode MCP probe body returned error: %v", err)
+			}
+			method, _ := payload["method"].(string)
+			gotMCPMethods = append(gotMCPMethods, method)
+			if method == "initialize" {
+				w.Header().Set("Mcp-Session-Id", "session-test")
+				writeJSON(t, w, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      1,
+					"result":  map[string]any{"protocolVersion": "2025-11-25"},
+				})
+				return
+			}
+			if r.Header.Get("Mcp-Session-Id") != "session-test" {
+				t.Fatalf("tools/list Mcp-Session-Id = %q, want session-test", r.Header.Get("Mcp-Session-Id"))
+			}
+			writeJSON(t, w, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      2,
+				"result":  map[string]any{"tools": []any{}},
+			})
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{
+		"debug",
+		"oauth",
+		server.URL + "/mcp",
+		"--client",
+		"chatgpt",
+		"--share",
+		"-endpoint",
+		server.URL,
+	})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if gotAuth != "Bearer operator-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotPayload.TargetURL != server.URL+"/mcp" {
+		t.Fatalf("TargetURL = %q, want target URL", gotPayload.TargetURL)
+	}
+	if gotPayload.ClientProfile != "chatgpt" || gotPayload.Mode != "gateway" {
+		t.Fatalf("unexpected compat payload: %+v", gotPayload)
+	}
+	if gotPayload.UpstreamMode != "proxy" || !gotPayload.Shareable {
+		t.Fatalf("unexpected upstream/share fields: %+v", gotPayload)
+	}
+	if strings.Join(gotMCPMethods, ",") != "initialize,tools/list" {
+		t.Fatalf("MCP probe methods = %#v, want initialize then tools/list", gotMCPMethods)
+	}
+	for _, probe := range []string{"oauth_discovery", "mcp_initialize", "tools_list"} {
+		if !containsString(gotPayload.SelectedProbes, probe) {
+			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
+		}
+	}
+	for _, want := range []string{
+		"https://console.staging.mcpctl.io/compat/r/crun_test",
+		"Debug Inbox",
+		"managed MCP server",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+	for _, unwanted := range []string{"Trace URL:", "Gateway URL:", "MCP initialize:", "MCP tools/list:"} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Fatalf("stdout = %q unexpectedly contained %q", stdout.String(), unwanted)
+		}
+	}
+}
+
+// TestDebugOAuthShareUnauthorizedPrintsLoginHint verifies expired cloud auth is actionable.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when a hosted share 401 omits the environment-specific login command.
+func TestDebugOAuthShareUnauthorizedPrintsLoginHint(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        stagingCloud,
+			AccessToken: "expired-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+externalURL(r, "/.well-known/oauth-protected-resource/mcp")+`"`)
+			http.Error(w, "missing token", http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/mcp":
+			writeJSON(t, w, map[string]any{
+				"resource":              externalURL(r, "/mcp"),
+				"authorization_servers": []string{externalURL(r, "/login/oauth")},
+			})
+		case "/.well-known/oauth-authorization-server/login/oauth":
+			writeJSON(t, w, map[string]any{
+				"authorization_endpoint": externalURL(r, "/login/oauth/authorize"),
+				"token_endpoint":         externalURL(r, "/login/oauth/access_token"),
+			})
+		case "/v1/operator/compat/runs":
+			w.WriteHeader(http.StatusUnauthorized)
+			writeJSON(t, w, map[string]any{
+				"error": map[string]any{
+					"code":    "unauthorized",
+					"message": "operator auth unauthorized",
+				},
+			})
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{
+		"debug",
+		"oauth",
+		server.URL + "/mcp",
+		"--client",
+		"chatgpt",
+		"--share",
+		"-endpoint",
+		stagingCloud,
+	})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	for _, want := range []string{
+		"OAuth debug",
+		"ChatGPT note:",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+	for _, want := range []string{
+		"warning: hosted share failed:",
+		"operator auth unauthorized",
+		"run `MCPCTL_ENV=staging mcpctl auth login` and retry --share",
+		"401 Unauthorized",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q missing %q", stderr.String(), want)
+		}
+	}
+}
+
+// TestDebugConnectCreatesHostedCompatibilityRun verifies the CLI calls the managed compatibility API.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when the CLI omits auth, sends the wrong payload, or hides run URLs.
+func TestDebugConnectCreatesHostedCompatibilityRun(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        "https://console.staging.mcpctl.io",
+			AccessToken: "operator-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	var gotAuth string
+	var gotPayload debugConnectRunRequest
+	var gotMCPMethods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/operator/compat/runs":
+			gotAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				t.Fatalf("Decode request body returned error: %v", err)
+			}
+			writeJSON(t, w, debugConnectRunResponse{
+				RunID:      "crun_test",
+				Status:     "failed",
+				TraceURL:   externalURL(r, "/compat/trace/crun_test/mcp/"),
+				ReportURL:  "https://console.staging.mcpctl.io/compat/r/crun_test",
+				GatewayURL: externalURL(r, "/compat/gateway/crun_test/mcp/"),
+			})
+		case "/compat/gateway/crun_test/mcp/":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("Decode MCP probe body returned error: %v", err)
+			}
+			method, _ := payload["method"].(string)
+			gotMCPMethods = append(gotMCPMethods, method)
+			if method == "initialize" {
+				w.Header().Set("Mcp-Session-Id", "session-test")
+				writeJSON(t, w, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      1,
+					"result":  map[string]any{"protocolVersion": "2025-11-25"},
+				})
+				return
+			}
+			if r.Header.Get("Mcp-Session-Id") != "session-test" {
+				t.Fatalf("tools/list Mcp-Session-Id = %q, want session-test", r.Header.Get("Mcp-Session-Id"))
+			}
+			writeJSON(t, w, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      2,
+				"result":  map[string]any{"tools": []any{}},
+			})
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+
+	code := runner.Run([]string{
+		"debug",
+		"connect",
+		server.URL + "/mcp",
+		"--client",
+		"chatgpt",
+		"--mode",
+		"gateway",
+		"--share",
+		"-endpoint",
+		server.URL,
+	})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if gotAuth != "Bearer operator-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotPayload.TargetURL != server.URL+"/mcp" || gotPayload.ClientProfile != "chatgpt" || gotPayload.Mode != "gateway" {
+		t.Fatalf("unexpected compat payload: %+v", gotPayload)
+	}
+	if gotPayload.UpstreamMode != "proxy" || !gotPayload.Shareable {
+		t.Fatalf("unexpected upstream/share fields: %+v", gotPayload)
+	}
+	if strings.Join(gotMCPMethods, ",") != "initialize,tools/list" {
+		t.Fatalf("MCP probe methods = %#v, want initialize then tools/list", gotMCPMethods)
+	}
+	for _, probe := range []string{"oauth_discovery", "mcp_initialize", "tools_list"} {
+		if !containsString(gotPayload.SelectedProbes, probe) {
+			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
+		}
+	}
+	for _, want := range []string{"Report:", "https://console.staging.mcpctl.io/compat/r/crun_test", "Debug Inbox", "managed MCP server"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+	for _, unwanted := range []string{"Trace URL:", "Gateway URL:", "MCP initialize:", "MCP tools/list:"} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Fatalf("stdout = %q unexpectedly contained %q", stdout.String(), unwanted)
+		}
+	}
+}
+
+// externalURL builds an absolute URL for the current httptest request host.
+//
+// Args:
+//
+//	r: Incoming request whose Host identifies the test server.
+//	path: Absolute path to attach to the server origin.
+//
+// Returns:
+//
+//	A test-server URL suitable for fixture payloads.
+func externalURL(r *http.Request, path string) string {
+	return "http://" + r.Host + path
+}
+
+// containsString reports whether a list includes one exact value.
+//
+// Args:
+//
+//	values: Candidate values from CLI output or request payloads.
+//	want: Exact value to find.
+//
+// Returns:
+//
+//	True when want appears in values.
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // writeJSON writes a JSON response for auth flow fixtures.
