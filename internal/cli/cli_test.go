@@ -94,7 +94,7 @@ func TestHelpListsPublicCommands(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 
-	for _, want := range []string{"init", "inspect", "validate", "debug oauth", "auth login", "cloud ping", "registry export"} {
+	for _, want := range []string{"init", "inspect", "validate", "debug oauth", "auth login", "cloud ping", "registry export", "tunnel"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output %q missing %q", stdout.String(), want)
 		}
@@ -121,6 +121,9 @@ func TestLocalCommandHelpDescribesDeveloperQuestions(t *testing.T) {
 		{args: []string{"auth", "login", "--help"}, want: "browser-based login"},
 		{args: []string{"cloud", "ping", "--help"}, want: "without logging in"},
 		{args: []string{"debug", "oauth", "--help"}, want: "OAuth discovery diagnostics"},
+		{args: []string{"tunnel", "--help"}, want: "managed tunnel"},
+		{args: []string{"tunnel", "create", "--help"}, want: "tunnel registration"},
+		{args: []string{"tunnel", "run", "--help"}, want: "STDIO MCP server"},
 	}
 
 	for _, tc := range cases {
@@ -132,6 +135,77 @@ func TestLocalCommandHelpDescribesDeveloperQuestions(t *testing.T) {
 		if !strings.Contains(stdout.String(), tc.want) {
 			t.Fatalf("Run(%v) output %q missing %q", tc.args, stdout.String(), tc.want)
 		}
+	}
+}
+
+// TestTunnelCreateCallsManagedAPI verifies tunnel creation reuses stored cloud auth.
+//
+// Args:
+//
+//	t: Test handle used for HTTP fixture setup and assertions.
+//
+// Returns:
+//
+//	None. The test fails when the CLI omits auth or misreads tunnel metadata.
+func TestTunnelCreateCallsManagedAPI(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tempHome, ".config"))
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	store := &memoryCredentialStore{
+		hasValue: true,
+		credential: credentialRecord{
+			Host:        "https://console.staging.mcpctl.io",
+			AccessToken: "operator-token",
+			TokenType:   "bearer",
+			Source:      "credential-store",
+		},
+	}
+	var gotAuth string
+	var gotPayload tunnelCreateRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/operator/tunnels" {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("Decode request body returned error: %v", err)
+		}
+		writeJSON(t, w, tunnelResponse{
+			TunnelID:   "tun_test",
+			ServerID:   "mcp_srv_test",
+			GatewayURL: "https://gateway.example/mcp/mcp_srv_test",
+			ConnectURL: "wss://gateway.example/tunnel/connect?tunnel_id=tun_test",
+			Token:      "tun_secret",
+			Status:     "pending",
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	runner := NewWithHTTPClient(&stdout, &stderr, server.Client())
+	runner.store = store
+	code := runner.Run([]string{"tunnel", "create", "--name", "internal-db", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("Run returned %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	}
+	if gotAuth != "Bearer operator-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotPayload.Name != "internal-db" {
+		t.Fatalf("payload = %+v, want tunnel name", gotPayload)
+	}
+	if !strings.Contains(stdout.String(), "mcpctl tunnel run --server mcp_srv_test -- <command>") {
+		t.Fatalf("stdout = %q missing next command", stdout.String())
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir() error = %v", err)
+	}
+	credentialPath := filepath.Join(configDir, "mcpctl", "tunnels", "tun_test.json")
+	if _, err := os.Stat(credentialPath); err != nil {
+		t.Fatalf("expected tunnel credential at %s: %v", credentialPath, err)
 	}
 }
 

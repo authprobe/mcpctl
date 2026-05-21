@@ -1,0 +1,10 @@
+{
+  "type": "request",
+  "request_id": "req_example",
+  "server_id": "mcp_srv_example",
+  "payload": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "tunnel_id": "tun_example",
+  "server_id": "mcp_srv_example",
+  "gateway_url": "https://gateway.mcpctl.io/mcp/mcp_srv_example",
+  "connect_url": "wss://tunnel.mcpctl.io/tunnel/connect?tunnel_id=tun_example",
+  "token": "tun_secret_example",
+  "status": "pending"
+}
