@@ -406,20 +406,26 @@ func (r *Runner) runDebugConnect(args []string) int {
 		fmt.Fprintf(r.stderr, "debug connect failed: %v\n", err)
 		return exitError
 	}
-	probeResult, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
-	fmt.Fprintf(r.stdout, "Compatibility run: %s (%s)\n", response.RunID, response.Status)
-	fmt.Fprintf(r.stdout, "Trace URL: %s\n", response.TraceURL)
-	fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
-	if strings.TrimSpace(response.GatewayURL) != "" {
-		fmt.Fprintf(r.stdout, "Gateway URL: %s\n", response.GatewayURL)
-	}
+	_, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
+	r.writeHostedDebugSummary(response)
 	if probeErr != nil {
 		fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
-	} else {
-		fmt.Fprintf(r.stdout, "MCP initialize: %s\n", probeResult.InitializeStatus)
-		fmt.Fprintf(r.stdout, "MCP tools/list: %s\n", probeResult.ToolsListStatus)
 	}
 	return exitOK
+}
+
+// writeHostedDebugSummary prints the public handoff for one hosted debug capture.
+//
+// Args:
+//
+//	response: Hosted compatibility run metadata returned by mcpctl.io.
+//
+// Returns:
+//
+//	None. The report URL and durable-server handoff hint are written to stdout.
+func (r *Runner) writeHostedDebugSummary(response debugConnectRunResponse) {
+	fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
+	fmt.Fprintln(r.stdout, "This capture is saved in the Debug Inbox. Promote it from Debug Logs to create a managed MCP server with auth, gateway history, and repeatable diagnostics.")
 }
 
 // createHostedCompatRun creates a hosted compatibility lab run through mcpctl.io.
@@ -663,26 +669,21 @@ func (r *Runner) runDebugOAuth(args []string) int {
 		fmt.Fprintf(r.stderr, "debug oauth failed: %v\n", err)
 		return exitError
 	}
-	r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
+	if !*share {
+		r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
+	}
 
 	if *share {
 		response, err := r.createHostedCompatRun(*endpoint, targetURL, strings.TrimSpace(*clientProfile), "gateway", true)
 		if err != nil {
+			r.writeOAuthDiscoveryReport(report, strings.TrimSpace(*clientProfile))
 			fmt.Fprintf(r.stderr, "warning: hosted share failed: %v\n", err)
 			return exitOK
 		}
-		probeResult, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
-		fmt.Fprintf(r.stdout, "Compatibility run: %s (%s)\n", response.RunID, response.Status)
-		fmt.Fprintf(r.stdout, "Trace URL: %s\n", response.TraceURL)
-		fmt.Fprintf(r.stdout, "Report: %s\n", response.ReportURL)
-		if strings.TrimSpace(response.GatewayURL) != "" {
-			fmt.Fprintf(r.stdout, "Gateway URL: %s\n", response.GatewayURL)
-		}
+		_, probeErr := r.runHostedMCPProbeTraffic(response, strings.TrimSpace(*clientProfile))
+		r.writeHostedDebugSummary(response)
 		if probeErr != nil {
 			fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
-		} else {
-			fmt.Fprintf(r.stdout, "MCP initialize: %s\n", probeResult.InitializeStatus)
-			fmt.Fprintf(r.stdout, "MCP tools/list: %s\n", probeResult.ToolsListStatus)
 		}
 	}
 	return exitOK

@@ -98,7 +98,7 @@ MCPCTL_ENV=staging mcpctl cloud ping
 mcpctl debug oauth https://api.githubcopilot.com/mcp/ --client chatgpt
 ```
 
-The command verifies the unauthenticated MCP response, protected resource metadata, path-aware authorization server metadata, and client-profile notes such as missing dynamic client registration. Add `--share` after `mcpctl auth login` to publish a managed compatibility trace with report, trace, and gateway URLs when the selected cloud endpoint supports hosted compatibility runs.
+The command verifies the unauthenticated MCP response, protected resource metadata, path-aware authorization server metadata, and client-profile notes such as missing dynamic client registration. Add `--share` after `mcpctl auth login` to publish a managed compatibility capture. Shared runs print one report URL; the capture also appears in the platform Debug Inbox, where it can be promoted into a managed MCP server when you want durable auth, gateway history, and repeated diagnostics.
 
 ## Cloud Auth
 

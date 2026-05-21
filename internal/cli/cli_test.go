@@ -799,17 +799,17 @@ func TestDebugOAuthCreatesHostedCompatibilityRun(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"OAuth debug",
-		"Dynamic client registration: not advertised",
-		"Compatibility run: crun_test (failed)",
-		"Trace URL:",
 		"https://console.staging.mcpctl.io/compat/r/crun_test",
-		"Gateway URL:",
-		"MCP initialize: 200 OK",
-		"MCP tools/list: 200 OK",
+		"Debug Inbox",
+		"managed MCP server",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+	for _, unwanted := range []string{"Trace URL:", "Gateway URL:", "MCP initialize:", "MCP tools/list:"} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Fatalf("stdout = %q unexpectedly contained %q", stdout.String(), unwanted)
 		}
 	}
 }
@@ -1005,9 +1005,14 @@ func TestDebugConnectCreatesHostedCompatibilityRun(t *testing.T) {
 			t.Fatalf("SelectedProbes = %#v missing %q", gotPayload.SelectedProbes, probe)
 		}
 	}
-	for _, want := range []string{"Compatibility run: crun_test (failed)", "Trace URL:", "Report:", "Gateway URL:", "MCP initialize: 200 OK", "MCP tools/list: 200 OK"} {
+	for _, want := range []string{"Report:", "https://console.staging.mcpctl.io/compat/r/crun_test", "Debug Inbox", "managed MCP server"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q missing %q", stdout.String(), want)
+		}
+	}
+	for _, unwanted := range []string{"Trace URL:", "Gateway URL:", "MCP initialize:", "MCP tools/list:"} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Fatalf("stdout = %q unexpectedly contained %q", stdout.String(), unwanted)
 		}
 	}
 }
