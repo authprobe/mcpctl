@@ -17,7 +17,11 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 const (
@@ -232,6 +236,54 @@ type tunnelResponse struct {
 //	A list of registered tunnels visible to the authenticated account.
 type tunnelListResponse struct {
 	Tunnels []tunnelResponse `json:"tunnels"`
+}
+
+// tunnelFrame is the JSON envelope exchanged with mcpctl.io tunnel WebSockets.
+//
+// Args:
+//
+//	None. Values are decoded from and encoded to the WebSocket.
+//
+// Returns:
+//
+//	One request, response, heartbeat, or error frame for the active tunnel.
+type tunnelFrame struct {
+	Type      string            `json:"type"`
+	RequestID string            `json:"request_id,omitempty"`
+	ServerID  string            `json:"server_id,omitempty"`
+	Payload   json.RawMessage   `json:"payload,omitempty"`
+	Error     *tunnelFrameError `json:"error,omitempty"`
+}
+
+// tunnelFrameError is a protocol-shaped failure sent over the tunnel.
+//
+// Args:
+//
+//	None. Values are serialized in a tunnel error frame.
+//
+// Returns:
+//
+//	Stable error code and human-readable message.
+type tunnelFrameError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// tunnelRunConfig stores optional file-based tunnel run settings.
+//
+// Args:
+//
+//	None. Values are decoded from JSON config files.
+//
+// Returns:
+//
+//	Tunnel credential metadata plus an optional local command.
+type tunnelRunConfig struct {
+	TunnelID   string   `json:"tunnel_id"`
+	ServerID   string   `json:"server_id"`
+	ConnectURL string   `json:"connect_url"`
+	Token      string   `json:"token"`
+	Command    []string `json:"command"`
 }
 
 // hostedMCPProbeResult summarizes a downstream probe sent through a hosted run URL.
@@ -595,7 +647,7 @@ func (r *Runner) runTunnelStatus(args []string) int {
 	return exitOK
 }
 
-// runTunnelRun validates the local tunnel-run command shape before the B1 bridge lands.
+// runTunnelRun launches a local STDIO MCP server and bridges it to mcpctl.io.
 //
 // Args:
 //
@@ -603,7 +655,7 @@ func (r *Runner) runTunnelStatus(args []string) int {
 //
 // Returns:
 //
-//	Process-style exit code; help succeeds and execution currently reports the B1 bridge boundary.
+//	Process-style exit code for tunnel startup and bridge execution.
 func (r *Runner) runTunnelRun(args []string) int {
 	if len(args) > 0 && isHelp(args[0]) {
 		fmt.Fprintln(r.stdout, "Usage: mcpctl tunnel run --server <server-id> -- <command> [args...]")
@@ -621,12 +673,24 @@ func (r *Runner) runTunnelRun(args []string) int {
 		fmt.Fprintln(r.stderr, "tunnel run requires --server or --config")
 		return exitUsage
 	}
-	if flags.NArg() == 0 && strings.TrimSpace(*configPath) == "" {
-		fmt.Fprintln(r.stderr, "tunnel run requires a command after -- unless --config is supplied")
+	command := flags.Args()
+	config, err := loadTunnelRunConfig(strings.TrimSpace(*configPath), strings.TrimSpace(*serverID))
+	if err != nil {
+		fmt.Fprintf(r.stderr, "load tunnel config: %v\n", err)
+		return exitError
+	}
+	if len(command) == 0 {
+		command = config.Command
+	}
+	if len(command) == 0 {
+		fmt.Fprintln(r.stderr, "tunnel run requires a command after -- or command in --config")
 		return exitUsage
 	}
-	fmt.Fprintln(r.stderr, "tunnel run bridge is not implemented yet; B1 will connect the WebSocket and STDIO process")
-	return exitError
+	if err := r.runTunnelBridge(config, command); err != nil {
+		fmt.Fprintf(r.stderr, "tunnel run failed: %v\n", err)
+		return exitError
+	}
+	return exitOK
 }
 
 // runDebugConnect starts a managed compatibility lab run for one MCP endpoint and client profile.
@@ -641,7 +705,8 @@ func (r *Runner) runTunnelRun(args []string) int {
 func (r *Runner) runDebugConnect(args []string) int {
 	if len(args) > 0 && isHelp(args[0]) {
 		fmt.Fprintln(r.stdout, "Usage: mcpctl debug connect <mcp-url> [--client name] [--mode trace|gateway] [--share] [-endpoint URL]")
-		fmt.Fprintln(r.stdout, "Run a managed client compatibility check for a remote MCP endpoint.")
+		fmt.Fprintln(r.stdout, "       mcpctl debug connect --tunnel <tunnel-id> [--client name] [--share] [-endpoint URL]")
+		fmt.Fprintln(r.stdout, "Run a managed client compatibility check for a remote or tunneled MCP endpoint.")
 		return exitOK
 	}
 	flags := flag.NewFlagSet("debug connect", flag.ContinueOnError)
@@ -650,14 +715,30 @@ func (r *Runner) runDebugConnect(args []string) int {
 	clientProfile := flags.String("client", "generic", "client compatibility profile, for example chatgpt")
 	mode := flags.String("mode", "trace", "compatibility run mode: trace or gateway")
 	share := flags.Bool("share", false, "request a shareable report URL")
+	tunnelID := flags.String("tunnel", "", "registered tunnel id to test through its managed gateway URL")
 	if err := flags.Parse(reorderDebugConnectArgs(args)); err != nil {
 		return exitUsage
 	}
-	if flags.NArg() != 1 {
+	if flags.NArg() != 1 && strings.TrimSpace(*tunnelID) == "" {
 		fmt.Fprintln(r.stderr, "Usage: mcpctl debug connect <mcp-url> [--client name] [--mode trace|gateway] [--share] [-endpoint URL]")
 		return exitUsage
 	}
-	targetURL := strings.TrimSpace(flags.Arg(0))
+	if flags.NArg() > 1 || (flags.NArg() == 1 && strings.TrimSpace(*tunnelID) != "") {
+		fmt.Fprintln(r.stderr, "debug connect accepts either <mcp-url> or --tunnel, not both")
+		return exitUsage
+	}
+	targetURL := ""
+	if flags.NArg() == 1 {
+		targetURL = strings.TrimSpace(flags.Arg(0))
+	}
+	if strings.TrimSpace(*tunnelID) != "" {
+		tunnel, err := r.loadManagedTunnel(*endpoint, strings.TrimSpace(*tunnelID))
+		if err != nil {
+			fmt.Fprintf(r.stderr, "debug connect failed: %v\n", err)
+			return exitError
+		}
+		targetURL = tunnel.GatewayURL
+	}
 	if _, err := url.ParseRequestURI(targetURL); err != nil {
 		fmt.Fprintf(r.stderr, "invalid MCP endpoint URL %q\n", targetURL)
 		return exitUsage
@@ -673,6 +754,39 @@ func (r *Runner) runDebugConnect(args []string) int {
 		fmt.Fprintf(r.stderr, "warning: hosted MCP probe failed: %v\n", probeErr)
 	}
 	return exitOK
+}
+
+// loadManagedTunnel fetches one managed tunnel row using stored cloud credentials.
+//
+// Args:
+//
+//	endpoint: Cloud endpoint serving tunnel APIs.
+//	tunnelID: Opaque tunnel id to inspect.
+//
+// Returns:
+//
+//	Tunnel metadata including its managed gateway URL.
+//
+// Errors:
+//
+//	Fails when credentials are missing or the tunnel API rejects the lookup.
+func (r *Runner) loadManagedTunnel(endpoint string, tunnelID string) (tunnelResponse, error) {
+	credential, err := r.store.Load()
+	if err != nil {
+		if errors.Is(err, errCredentialNotFound) {
+			return tunnelResponse{}, fmt.Errorf("not authenticated; run `%s` before loading tunnels", authLoginCommandForEndpoint(endpoint))
+		}
+		return tunnelResponse{}, fmt.Errorf("load cloud credentials: %w", err)
+	}
+	var response tunnelResponse
+	path := "/v1/operator/tunnels/" + url.PathEscape(strings.TrimSpace(tunnelID))
+	if err := r.getAuthenticatedJSON(endpoint, path, credential.AccessToken, &response); err != nil {
+		return tunnelResponse{}, err
+	}
+	if strings.TrimSpace(response.GatewayURL) == "" {
+		return tunnelResponse{}, errors.New("managed tunnel response did not include gateway_url")
+	}
+	return response, nil
 }
 
 // writeHostedDebugSummary prints the public handoff for one hosted debug capture.
@@ -1039,7 +1153,7 @@ func debugConnectFlagNeedsValue(arg string) bool {
 		return false
 	}
 	switch strings.TrimLeft(arg, "-") {
-	case "client", "endpoint", "mode":
+	case "client", "endpoint", "mode", "tunnel":
 		return true
 	default:
 		return false
@@ -1884,6 +1998,214 @@ func writeTunnelCredential(response tunnelResponse) error {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), tunnelConfigMode)
+}
+
+// loadTunnelRunConfig loads stored tunnel credentials by server id or explicit config.
+//
+// Args:
+//
+//	configPath: Optional JSON config path supplied by --config.
+//	serverID: Optional server id returned by `mcpctl tunnel create`.
+//
+// Returns:
+//
+//	Tunnel run settings with connect URL and token populated.
+//
+// Errors:
+//
+//	Returns filesystem, JSON, or not-found errors when credentials cannot be loaded.
+func loadTunnelRunConfig(configPath string, serverID string) (tunnelRunConfig, error) {
+	if strings.TrimSpace(configPath) != "" {
+		return readTunnelRunConfig(configPath)
+	}
+	if strings.TrimSpace(serverID) == "" {
+		return tunnelRunConfig{}, errors.New("--server is required when --config is not supplied")
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return tunnelRunConfig{}, err
+	}
+	dir := filepath.Join(configDir, "mcpctl", "tunnels")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return tunnelRunConfig{}, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		cfg, err := readTunnelRunConfig(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(cfg.ServerID) == strings.TrimSpace(serverID) {
+			return cfg, nil
+		}
+	}
+	return tunnelRunConfig{}, fmt.Errorf("no stored tunnel credential for server %s; run `mcpctl tunnel create` first", strings.TrimSpace(serverID))
+}
+
+// readTunnelRunConfig decodes one stored tunnel JSON file.
+//
+// Args:
+//
+//	path: Absolute or relative JSON config file path.
+//
+// Returns:
+//
+//	Tunnel run settings normalized from either create response or config format.
+//
+// Errors:
+//
+//	Returns filesystem, JSON, or validation errors for unusable credentials.
+func readTunnelRunConfig(path string) (tunnelRunConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tunnelRunConfig{}, err
+	}
+	var cfg tunnelRunConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return tunnelRunConfig{}, err
+	}
+	if strings.TrimSpace(cfg.TunnelID) == "" || strings.TrimSpace(cfg.ServerID) == "" || strings.TrimSpace(cfg.ConnectURL) == "" || strings.TrimSpace(cfg.Token) == "" {
+		var response tunnelResponse
+		if err := json.Unmarshal(data, &response); err != nil {
+			return tunnelRunConfig{}, err
+		}
+		cfg = tunnelRunConfig{
+			TunnelID:   response.TunnelID,
+			ServerID:   response.ServerID,
+			ConnectURL: response.ConnectURL,
+			Token:      response.Token,
+		}
+	}
+	if strings.TrimSpace(cfg.ConnectURL) == "" || strings.TrimSpace(cfg.Token) == "" {
+		return tunnelRunConfig{}, errors.New("tunnel config is missing connect_url or token")
+	}
+	return cfg, nil
+}
+
+// runTunnelBridge connects to mcpctl.io and bridges WebSocket frames to STDIO.
+//
+// Args:
+//
+//	config: Tunnel credential and endpoint metadata.
+//	command: Local STDIO MCP server command and arguments.
+//
+// Returns:
+//
+//	nil when the tunnel exits cleanly.
+//
+// Errors:
+//
+//	Returns process, WebSocket, or frame routing errors.
+func (r *Runner) runTunnelBridge(config tunnelRunConfig, command []string) error {
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+	go func() {
+		_, _ = io.Copy(r.stderr, stderr)
+	}()
+	wsURL := strings.TrimSpace(config.ConnectURL)
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + strings.TrimSpace(config.Token)}},
+	})
+	if err != nil {
+		return err
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "mcpctl tunnel stopped")
+	fmt.Fprintf(r.stdout, "Tunnel connected: %s -> %s\n", strings.TrimSpace(config.TunnelID), strings.Join(command, " "))
+	return r.bridgeTunnelFrames(ctx, conn, strings.TrimSpace(config.ServerID), stdin, stdout)
+}
+
+// bridgeTunnelFrames serializes tunnel requests through one STDIO process.
+//
+// Args:
+//
+//	ctx: Bridge lifetime context.
+//	conn: Active WebSocket connection to mcpctl.io.
+//	serverID: Managed MCP server id expected on request frames.
+//	stdin: Local process stdin receiving JSON-RPC request lines.
+//	stdout: Local process stdout producing JSON-RPC response lines.
+//
+// Returns:
+//
+//	nil when the WebSocket closes normally.
+//
+// Errors:
+//
+//	Returns read/write failures from WebSocket or STDIO.
+func (r *Runner) bridgeTunnelFrames(ctx context.Context, conn *websocket.Conn, serverID string, stdin io.Writer, stdout io.Reader) error {
+	reader := bufio.NewReader(stdout)
+	var stdioMu sync.Mutex
+	for {
+		var frame tunnelFrame
+		if err := wsjson.Read(ctx, conn, &frame); err != nil {
+			return err
+		}
+		if frame.Type != "request" {
+			continue
+		}
+		if strings.TrimSpace(frame.ServerID) != "" && strings.TrimSpace(serverID) != "" && strings.TrimSpace(frame.ServerID) != strings.TrimSpace(serverID) {
+			if err := writeTunnelFrame(ctx, conn, tunnelFrame{Type: "error", RequestID: frame.RequestID, ServerID: serverID, Error: &tunnelFrameError{Code: "wrong_server", Message: "request was routed to the wrong tunnel server"}}); err != nil {
+				return err
+			}
+			continue
+		}
+		stdioMu.Lock()
+		_, writeErr := stdin.Write(append(append([]byte(nil), frame.Payload...), '\n'))
+		var response []byte
+		if writeErr == nil {
+			response, writeErr = reader.ReadBytes('\n')
+		}
+		stdioMu.Unlock()
+		if writeErr != nil {
+			if err := writeTunnelFrame(ctx, conn, tunnelFrame{Type: "error", RequestID: frame.RequestID, ServerID: serverID, Error: &tunnelFrameError{Code: "stdio_error", Message: writeErr.Error()}}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := writeTunnelFrame(ctx, conn, tunnelFrame{Type: "response", RequestID: frame.RequestID, ServerID: serverID, Payload: json.RawMessage(bytes.TrimSpace(response))}); err != nil {
+			return err
+		}
+	}
+}
+
+// writeTunnelFrame serializes one WebSocket frame to the cloud tunnel.
+//
+// Args:
+//
+//	ctx: Write deadline context.
+//	conn: Active WebSocket connection.
+//	frame: Response or error frame to send.
+//
+// Returns:
+//
+//	nil when the frame is written.
+//
+// Errors:
+//
+//	Returns WebSocket write failures.
+func writeTunnelFrame(ctx context.Context, conn *websocket.Conn, frame tunnelFrame) error {
+	return wsjson.Write(ctx, conn, frame)
 }
 
 // Error formats an HTTP status failure as a concise CLI diagnostic.

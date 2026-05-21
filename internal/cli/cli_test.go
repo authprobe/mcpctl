@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +14,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 // memoryCredentialStore keeps credentials in memory for CLI auth tests.
@@ -206,6 +212,136 @@ func TestTunnelCreateCallsManagedAPI(t *testing.T) {
 	credentialPath := filepath.Join(configDir, "mcpctl", "tunnels", "tun_test.json")
 	if _, err := os.Stat(credentialPath); err != nil {
 		t.Fatalf("expected tunnel credential at %s: %v", credentialPath, err)
+	}
+}
+
+// TestDebugConnectTunnelUsesGatewayURL verifies compatibility runs can target a managed tunnel.
+//
+// Args:
+//
+//	t: Test handle used for assertions and helper failures.
+//
+// Returns:
+//
+//	None. The test fails when --tunnel does not resolve through the cloud API.
+func TestDebugConnectTunnelUsesGatewayURL(t *testing.T) {
+	store := &memoryCredentialStore{credential: credentialRecord{AccessToken: "access-token"}, hasValue: true}
+	var gotTarget string
+	probeCount := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/operator/tunnels/tun_test":
+			if r.Header.Get("Authorization") != "Bearer access-token" {
+				t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+			}
+			writeJSON(t, w, tunnelResponse{TunnelID: "tun_test", ServerID: "mcp_srv_test", GatewayURL: server.URL + "/mcp"})
+		case "/v1/operator/compat/runs":
+			if r.Header.Get("Authorization") != "Bearer access-token" {
+				t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+			}
+			var payload debugConnectRunRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			gotTarget = payload.TargetURL
+			writeJSON(t, w, debugConnectRunResponse{RunID: "run_1", Status: "created", TraceURL: "https://trace", ReportURL: "https://report", GatewayURL: payload.TargetURL})
+		case "/mcp":
+			probeCount++
+			w.Header().Set("Mcp-Session-Id", "sess_1")
+			writeJSON(t, w, map[string]any{"jsonrpc": "2.0", "id": probeCount, "result": map[string]any{"ok": true}})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	runner := New(&stdout, &stderr)
+	runner.store = store
+	code := runner.Run([]string{"debug", "connect", "--tunnel", "tun_test", "-endpoint", server.URL})
+	if code != exitOK {
+		t.Fatalf("debug connect --tunnel code=%d stderr=%s", code, stderr.String())
+	}
+	if gotTarget != server.URL+"/mcp" {
+		t.Fatalf("target_url = %q, want tunnel gateway", gotTarget)
+	}
+}
+
+// TestBridgeTunnelFramesSerializesSTDIO verifies WebSocket request frames reach a STDIO process.
+//
+// Args:
+//
+//	t: Test handle used for assertions and helper failures.
+//
+// Returns:
+//
+//	None. The test fails when frame routing or response correlation regresses.
+func TestBridgeTunnelFramesSerializesSTDIO(t *testing.T) {
+	requestReceived := make(chan string, 1)
+	responseReceived := make(chan tunnelFrame, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		request := tunnelFrame{Type: "request", RequestID: "treq_1", ServerID: "mcp_srv_1", Payload: []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)}
+		if err := wsjson.Write(context.Background(), conn, request); err != nil {
+			t.Errorf("server write request: %v", err)
+			return
+		}
+		var response tunnelFrame
+		if err := wsjson.Read(context.Background(), conn, &response); err != nil {
+			t.Errorf("server read response: %v", err)
+			return
+		}
+		responseReceived <- response
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test done")
+	processInReader, processInWriter := io.Pipe()
+	processOutReader, processOutWriter := io.Pipe()
+	defer processInReader.Close()
+	defer processOutWriter.Close()
+	go func() {
+		line, _ := bufio.NewReader(processInReader).ReadString('\n')
+		requestReceived <- strings.TrimSpace(string(line))
+		_, _ = processOutWriter.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}` + "\n"))
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- New(io.Discard, io.Discard).bridgeTunnelFrames(context.Background(), conn, "mcp_srv_1", processInWriter, processOutReader)
+	}()
+
+	select {
+	case got := <-requestReceived:
+		if got != `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` {
+			t.Fatalf("stdio request = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for STDIO request")
+	}
+	select {
+	case response := <-responseReceived:
+		if response.Type != "response" || response.RequestID != "treq_1" || string(response.Payload) != `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}` {
+			t.Fatalf("response frame = %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for tunnel response")
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "done")
+	select {
+	case <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge did not exit after close")
 	}
 }
 
